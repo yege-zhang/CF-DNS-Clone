@@ -1104,8 +1104,22 @@ button { cursor: pointer; font-weight: 600; padding: .6rem 1.2rem; border-radius
 button[type=submit], button:not(.outline,.secondary,.contrast) { background-color: rgb(var(--color-primary)); color: rgb(var(--c-text-on-primary)); }
 button[type=submit]:hover, button:not(.outline,.secondary,.contrast):hover { background-color: rgb(var(--color-primary-hover)); }
 button.secondary { background-color: rgb(var(--c-sidebar-bg)); color: rgb(var(--c-text)); border: 1px solid rgb(var(--c-border)); }
-button.contrast { background: transparent; border-color: rgb(var(--c-border)); }
+button.contrast { background: transparent; border-color: rgb(var(--c-border)); color: rgb(var(--c-text-secondary)); }
 button.outline { background: transparent; border-color: rgb(var(--color-primary)); color: rgb(var(--color-primary)); }
+button.edit-btn {
+  color: #eab308; /* 黄色 */
+  border-color: #eab308;
+}
+button.edit-btn:hover {
+  background-color: rgba(234, 179, 8, 0.1);
+}
+button.delete-btn {
+  color: #ef4444; /* 红色 */
+  border-color: #ef4444;
+}
+button.delete-btn:hover {
+  background-color: rgba(239, 68, 68, 0.1);
+}
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 button[aria-busy=true] { color: transparent !important; }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
@@ -1844,7 +1858,7 @@ function renderDomainCard(domain) {
       <div class="card-col"><strong>我的域名 → 克隆源</strong><span class="domain-cell" title="\${domain.target_domain}" onclick="window.copyToClipboard('\${domain.target_domain}')">\${displayContent}</span><small class="domain-cell" title="\${domain.source_domain}">\${sourceDisplay}</small></div>
       <div class="card-col"><strong>当前解析 <svg class="refresh-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" title="实时查询解析" onclick="window.refreshSingleDomainRecords(\${domain.id})"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg></strong><div id="records-container-\${domain.id}">\${renderLiveRecords(displayedRecords)}</div></div>
       <div class="card-col"><strong>上次同步</strong><div>\${renderStatus(domain)}</div><small>\${formatBeijingTime(domain.last_synced_time)}</small></div>
-      <div class="card-actions"><button class="outline" onclick="window.individualSync(\${domain.id})">同步</button><button class="secondary" onclick="window.openModal('domainModal', \${domain.id})">编辑</button><button class="contrast" onclick="window.deleteDomain(\${domain.id})" \${isSystem ? 'disabled' : ''}>删除</button></div>
+      <div class="card-actions"><button class="outline" onclick="window.individualSync(\${domain.id})">同步</button><button class="outline edit-btn" onclick="window.openModal('domainModal', \${domain.id})">编辑</button><button class="outline delete-btn" onclick="window.deleteDomain(\${domain.id})" \${isSystem ? 'disabled' : ''}>删除</button></div>
   </div>\`;
 }
 function renderDomainList() { 
@@ -1863,7 +1877,7 @@ function renderIpSourceCard(source) {
       <div class="card-col" style="flex-grow: 2;"><strong>GitHub 文件路径</strong><a href="\${fileUrl}" target="_blank" class="domain-cell" onclick="event.stopPropagation();">\${source.github_path}</a><small class="domain-cell" title="\${source.url}">源: \${source.url}</small></div>
       <div class="card-col"><strong>抓取策略</strong><span>\${source.fetch_strategy || '尚未探测'}</span></div>
       <div class="card-col"><strong>上次同步</strong><small>\${renderStatus(source)} @ \${formatBeijingTime(source.last_synced_time)}</small></div>
-      <div class="card-actions"><button class="outline" onclick="window.syncSingleIpSource(\${source.id})">同步</button><button class="secondary" onclick="window.openModal('ipSourceModal', \${source.id})">编辑</button><button class="contrast" onclick="window.deleteIpSource(\${source.id})">删除</button></div>
+      <div class="card-actions"><button class="outline" onclick="window.syncSingleIpSource(\${source.id})">同步</button><button class="outline edit-btn" onclick="window.openModal('ipSourceModal', \${source.id})">编辑</button><button class="outline delete-btn" onclick="window.deleteIpSource(\${source.id})">删除</button></div>
   </div>\`;
 }
 function renderIpSourceList() { 
