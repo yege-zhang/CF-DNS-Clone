@@ -508,7 +508,7 @@ async function ensureInitialData(db, zoneId, zoneName) {
 
   const initialIpSources = [
       { url: _e(_d([104,116,116,112,115,58,47,47,105,112,100,98,46,97,112,105,46,48,51,48,49,48,49,46,120,121,122,47,63,116,121,112,101,61,98,101,115,116,99,102,38,99,111,117,110,116,114,121,61,116,114,117,101])), path: '030101-bestcf.txt', msg: 'Update BestCF IPs from 030101.xyz', strategy: _k(['phantomjs','_cloud']) },
-      { url: _e(_d([104,116,116,112,115,58,47,47,105,112,100,98,46,97,112,105,46,48,51,48,49,48,49,46,120,121,122,47,63,116,121,112,101,61,98,101,115,116,112,114,111,120,121,38,99,111,117,110,116,114,121,61,116,114,117,101])), path: '030101-bestproxy.txt', msg: 'Update BestProxy IPs from 030101.xyz', strategy: _k(['phantomjs','_cloud']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,105,112,100,98,46,97,112,105,46,48,51,48,49,48,49,46,120,121,122,47,63,116,121,112,101,61,98,101,115,116,112,114,111,121,38,99,111,117,110,116,114,121,61,116,114,117,101])), path: '030101-bestproxy.txt', msg: 'Update BestProxy IPs from 030101.xyz', strategy: _k(['phantomjs','_cloud']) },
       { url: _e(_d([104,116,116,112,115,58,47,47,105,112,46,49,54,52,55,52,54,46,120,121,122])), path: '164746.txt', msg: 'Update IPs from 164746.xyz', strategy: _k(['direct','_regex']) },
       { url: _e(_d([104,116,116,112,115,58,47,47,115,116,111,99,107,46,104,111,115,116,109,111,110,105,116,46,99,111,109,47,67,108,111,117,100,70,108,97,114,101,89,101,115])), path: 'CloudFlareYes.txt', msg: 'Update CloudFlareYes IPs', strategy: _k(['phantomjs','_cloud']) },
       { url: _e(_d([104,116,116,112,115,58,47,47,105,112,46,104,97,111,103,101,103,101,46,120,121,122])), path: 'haogege.txt', msg: 'Update IPs from haogege.xyz', strategy: _k(['direct','_regex']) },
@@ -961,294 +961,173 @@ async function apiLiveResolveDomain(id, env) {
     }
 }
 
-
 async function handleUiRequest(request, env) {
-const url = new URL(request.url);
-const path = url.pathname;
-const db = env.WUYA;
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const db = env.WUYA;
 
-const isInitialized = !!(await getSetting(db, 'ADMIN_PASSWORD_HASH'));
-const loggedIn = await isAuthenticated(request, db);
-let pageContent, pageTitle;
+    const isInitialized = !!(await getSetting(db, 'ADMIN_PASSWORD_HASH'));
+    const loggedIn = await isAuthenticated(request, db);
+    let pageContent, pageTitle;
 
-if (!isInitialized) {
-  pageTitle = '系统初始化';
-  pageContent = getSetupPage();
-} else if (path === '/admin' && loggedIn) {
-  pageTitle = 'DNS Clone Dashboard';
-  const settingsPromise = getFullSettings(db);
-  const settings = await settingsPromise;
-  
-  const { token, zoneId } = await getCfApiSettings(db);
-  if (token && zoneId) {
-      try {
-          settings.zoneName = await getZoneName(token, zoneId);
-      } catch(e) { console.warn("Could not fetch zone name.", e.message); }
-  }
+    if (!isInitialized) {
+        pageTitle = '系统初始化';
+        pageContent = getSetupPage();
+        return new Response(getHtmlLayout(pageTitle, pageContent), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+    } else if (path === '/admin' && loggedIn) {
+        pageTitle = 'DNS Clone Dashboard';
+        const settingsPromise = getFullSettings(db);
+        const settings = await settingsPromise;
 
-  const domainsPromise = db.prepare("SELECT id, source_domain, target_domain, zone_id, is_deep_resolve, ttl, notes, resolve_record_limit, is_single_resolve, single_resolve_limit, single_resolve_node_names, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_system, displayed_records FROM domains ORDER BY is_system DESC, id").all();
-  const ipSourcesPromise = db.prepare("SELECT id, url, github_path, commit_message, fetch_strategy, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_node_generation_enabled, node_names FROM ip_sources ORDER BY github_path").all();
-  
-  let [{ results: domains }, { results: ipSources }] = await Promise.all([domainsPromise, ipSourcesPromise]);
-  ipSources = ipSources.map(s => ({...s, url: _du(s.url)}));
+        const { token, zoneId } = await getCfApiSettings(db);
+        if (token && zoneId) {
+            try {
+                settings.zoneName = await getZoneName(token, zoneId);
+            } catch (e) { console.warn("Could not fetch zone name.", e.message); }
+        }
 
-  pageContent = await getDashboardPage(domains, ipSources, settings);
-} else if (path === '/admin' && !loggedIn) {
-  return new Response(null, { status: 302, headers: { 'Location': '/' } });
-} else {
-  pageTitle = 'CF-DNS-Clon';
-  const domainsPromise = db.prepare("SELECT source_domain, target_domain, notes, last_synced_time, is_system, is_single_resolve, single_resolve_limit, last_synced_records FROM domains WHERE is_enabled = 1 ORDER BY is_system DESC, id").all();
-  const ipSourcesPromise = db.prepare("SELECT url, github_path, last_synced_time FROM ip_sources WHERE is_enabled = 1 ORDER BY github_path").all();
-  const threeNetworkSourcePromise = getSetting(db, 'THREE_NETWORK_SOURCE');
-  const proxySettingsPromise = getProxySettings(db);
+        const domainsPromise = db.prepare("SELECT id, source_domain, target_domain, zone_id, is_deep_resolve, ttl, notes, resolve_record_limit, is_single_resolve, single_resolve_limit, single_resolve_node_names, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_system, displayed_records FROM domains ORDER BY is_system DESC, id").all();
+        const ipSourcesPromise = db.prepare("SELECT id, url, github_path, commit_message, fetch_strategy, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_node_generation_enabled, node_names FROM ip_sources ORDER BY github_path").all();
 
-  let [{ results: domains }, { results: ipSources }, threeNetworkSource, proxySettings] = await Promise.all([domainsPromise, ipSourcesPromise, threeNetworkSourcePromise, proxySettingsPromise]);
-  ipSources = ipSources.map(s => ({...s, url: _du(s.url)}));
+        let [{ results: domains }, { results: ipSources }] = await Promise.all([domainsPromise, ipSourcesPromise]);
+        ipSources = ipSources.map(s => ({ ...s, url: _du(s.url) }));
 
-  const sourceNameMap = { CloudFlareYes: 'CloudFlareYes', 'api.uouin.com': 'UoUin', 'wetest.vip': 'Wetest' };
-  const sourceDisplayName = sourceNameMap[threeNetworkSource] || '未知';
+        pageContent = await getDashboardPage(domains, ipSources, settings);
+        return new Response(getHtmlLayout(pageTitle, pageContent), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+    } else if (path === '/admin' && !loggedIn) {
+        return new Response(null, { status: 302, headers: { 'Location': '/' } });
+    } else {
+        const domainsPromise = db.prepare("SELECT source_domain, target_domain, notes, last_synced_time, is_system, is_single_resolve, single_resolve_limit, last_synced_records FROM domains WHERE is_enabled = 1 ORDER BY is_system DESC, id").all();
+        const ipSourcesPromise = db.prepare("SELECT url, github_path, last_synced_time FROM ip_sources WHERE is_enabled = 1 ORDER BY github_path").all();
+        const threeNetworkSourcePromise = getSetting(db, 'THREE_NETWORK_SOURCE');
+        const proxySettingsPromise = getProxySettings(db);
 
-  pageContent = getPublicHomepage(request.url, domains, ipSources, sourceDisplayName, loggedIn, proxySettings);
+        let [{ results: domains }, { results: ipSources }, threeNetworkSource, proxySettings] = await Promise.all([domainsPromise, ipSourcesPromise, threeNetworkSourcePromise, proxySettingsPromise]);
+        ipSources = ipSources.map(s => ({ ...s, url: _du(s.url) }));
+
+        const sourceNameMap = { CloudFlareYes: 'CloudFlareYes', 'api.uouin.com': 'UoUin', 'wetest.vip': 'Wetest' };
+        const sourceDisplayName = sourceNameMap[threeNetworkSource] || '未知';
+
+        const homepageHtml = getPublicHomepage(request.url, domains, ipSources, sourceDisplayName, loggedIn, proxySettings);
+        return new Response(homepageHtml, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+    }
 }
-return new Response(getHtmlLayout(pageTitle, pageContent, { proxySettings: await getProxySettings(env.WUYA) }), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
-}
 
-function getHtmlLayout(title, content, options = {}) { 
-  const { proxySettings = {} } = options;
-  return `<!DOCTYPE html><html lang="zh-CN" class="${proxySettings.APP_THEME || 'default'}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>${title}</title><link rel="stylesheet" href="${_d([104,116,116,112,115,58,47,47,99,100,110,46,106,115,100,101,108,105,118,114,46,110,101,116,47,110,112,109,47,64,112,105,99,111,99,115,115,47,112,105,99,111,64,50,47,99,115,115,47,112,105,99,111,46,109,105,110,46,99,115,115])}"><link rel="stylesheet" href="${_d([104,116,116,112,115,58,47,47,99,100,110,106,115,46,99,108,111,117,100,102,108,97,114,101,46,99,111,109,47,97,106,97,120,47,108,105,98,115,47,102,111,110,116,45,97,119,101,115,111,109,101,47,54,46,53,46,49,47,99,115,115,47,97,108,108,46,109,105,110,46,99,115,115])}"><style>
+function getHtmlLayout(title, content) { 
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>${title}</title><style>
 :root {
-  --sidebar-width: 250px;
-  --pico-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --pico-font-size: 16px;
-  --pico-line-height: 1.6;
-  --pico-border-radius: 12px;
-  --pico-form-element-spacing-vertical: 1rem;
-  --pico-form-element-spacing-horizontal: 1.25rem;
-  --pico-shadow-sm: 0 2px 4px rgba(0,0,0,0.05);
-  --pico-shadow-md: 0 4px 12px rgba(0,0,0,0.1);
-  --pico-shadow-lg: 0 10px 30px rgba(0,0,0,0.1);
-  --c-primary: #007aff;
-  --c-primary-hover: #0056b3;
-  --c-bg: #f0f2f5;
-  --c-bg-blur: rgba(248, 249, 250, 0.7);
-  --c-card-bg: rgba(255, 255, 255, 0.6);
-  --c-card-border: rgba(255, 255, 255, 0.9);
-  --c-text: #212529;
-  --c-text-muted: #6c757d;
-  --c-text-accent: var(--c-primary);
-  --c-icon-bg: #e9ecef;
-  --c-button-bg: var(--c-primary);
-  --c-button-text: #ffffff;
-  --noise-bg: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency="0.65" numOctaves="3" stitchTiles="stitch"/></filter><rect width="100%" height="100%" filter="url(%23n)" opacity="0.1"/></svg>');
+    --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;
+    --sidebar-width: 240px;
+    --radius: 0.75rem;
+    --color-primary: 3, 105, 161;
+    --color-primary-hover: 7, 89, 133;
+    --c-bg: 243, 244, 246;
+    --c-sidebar-bg: 229, 231, 235;
+    --c-card-bg: 255, 255, 255;
+    --c-border: 229, 231, 235;
+    --c-text: 17, 24, 39;
+    --c-text-secondary: 75, 85, 99;
+    --c-text-on-primary: 255, 255, 255;
+    --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+    --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+    --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
 }
-html.aurora-dark {
-  --c-primary: #5e5ce6;
-  --c-primary-hover: #7d7aff;
-  --c-bg: #1c1c1e;
-  --c-bg-blur: rgba(28, 28, 30, 0.7);
-  --c-card-bg: rgba(44, 44, 46, 0.5);
-  --c-card-border: rgba(255, 255, 255, 0.1);
-  --c-text: #f2f2f7;
-  --c-text-muted: #8e8e93;
-  --c-text-accent: var(--c-primary);
-  --c-icon-bg: #3a3a3c;
+html.dark {
+    --color-primary: 34, 211, 238;
+    --color-primary-hover: 103, 232, 249;
+    --c-bg: 17, 24, 39;
+    --c-sidebar-bg: 31, 41, 55;
+    --c-card-bg: 31, 41, 55;
+    --c-border: 55, 65, 81;
+    --c-text: 229, 231, 235;
+    --c-text-secondary: 156, 163, 175;
+    --c-text-on-primary: 17, 24, 39;
 }
-html.serene-light {
-  --c-primary: #32ADEA;
-  --c-primary-hover: #298cb8;
-  --c-bg: #f7f9fc;
-  --c-bg-blur: rgba(247, 249, 252, 0.7);
-  --c-card-bg: rgba(255, 255, 255, 0.8);
-  --c-card-border: rgba(0, 0, 0, 0.05);
-  --c-text: #333;
-  --c-text-muted: #6a737d;
-  --pico-shadow-sm: 0 3px 6px rgba(0,0,0,0.04);
-  --pico-shadow-md: 0 5px 15px rgba(0,0,0,0.06);
-  --pico-shadow-lg: 0 10px 30px rgba(0,0,0,0.08);
-}
-body {
-  font-family: var(--pico-font-family);
-  margin: 0;
-  background-color: var(--c-bg);
-  color: var(--c-text);
-  transition: background-color 0.3s ease, color 0.3s ease;
-  overflow-x: hidden;
-}
-.public-body-wrapper {
-  position: relative;
-  z-index: 1;
-  width: 100%;
-  min-height: 100vh;
-}
-.background-blurs {
-  position: fixed;
-  top: 0; left: 0;
-  width: 100%; height: 100%;
-  overflow: hidden;
-  z-index: 0;
-}
-html.aurora-dark .background-blurs::before { content:''; position:absolute; width:100%; height:100%; background:var(--noise-bg); opacity: 0.2; }
-.blur-orb {
-  position: absolute;
-  border-radius: 50%;
-  filter: blur(100px);
-  opacity: 0.2;
-  animation: move 20s infinite alternate;
-}
-.blur-orb-1 { width: 500px; height: 500px; top: 10%; left: 10%; background-color: #007aff; }
-html.aurora-dark .blur-orb-1 { background-color: #5e5ce6; opacity: 0.4; }
-html.serene-light .blur-orb-1 { background-color: #89CFF0; opacity: 0.3; }
-.blur-orb-2 { width: 400px; height: 400px; bottom: 10%; right: 10%; background-color: #ff3b30; animation-delay: -10s;}
-html.aurora-dark .blur-orb-2 { background-color: #ff375f; opacity: 0.4; }
-html.serene-light .blur-orb-2 { background-color: #FFD580; opacity: 0.3; }
-
-@keyframes move {
-  from { transform: translate(-50px, -50px) rotate(0deg); }
-  to { transform: translate(50px, 50px) rotate(360deg); }
-}
-main.container { max-width: none; padding: 0; display: flex; }
-.sidebar { width: var(--sidebar-width); flex-shrink: 0; background: var(--pico-card-background-color); height: 100vh; position: sticky; top: 0; border-right: 1px solid var(--pico-card-border-color); display: flex; flex-direction: column; }
-.sidebar-header { padding: 1.5rem; text-align: left; border-bottom: 1px solid var(--pico-card-border-color); }
-.sidebar-header h3 { margin: 0; font-size: 1.75rem; font-weight: 700; color: var(--pico-primary); }
-.sidebar-nav { padding: 1rem 0; flex-grow: 1; }
-.sidebar-nav a { display: flex; align-items: center; gap: .85rem; padding: .85rem 1.5rem; color: #495057; text-decoration: none; margin: 0 .75rem; border-radius: 6px; transition: background-color .2s ease, color .2s ease; font-weight: 500; }
-.sidebar-nav a:hover { background: #e9ecef; color: #212529; }
-.sidebar-nav a.active { color: #fff; background-color: var(--pico-primary); font-weight: 600; }
-.main-content { flex-grow: 1; padding: 2.5rem; }
-.page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
-.page-header h2 { margin: 0; font-size: 2rem; font-weight: 700; }
+*, ::before, ::after { box-sizing: border-box; border-width: 0; border-style: solid; border-color: rgb(var(--c-border)); }
+html { font-family: var(--font-sans); line-height: 1.5; -webkit-tap-highlight-color: transparent; }
+body { margin: 0; line-height: inherit; background-color: rgb(var(--c-bg)); color: rgb(var(--c-text)); transition: background-color .3s, color .3s; }
+svg { display: block; vertical-align: middle; }
+.icon { width: 1.25rem; height: 1.25rem; stroke-width: 1.5; }
+main.container { display: flex; min-height: 100vh; }
+.sidebar { width: var(--sidebar-width); flex-shrink: 0; background-color: rgb(var(--c-sidebar-bg)); display: flex; flex-direction: column; border-right: 1px solid rgb(var(--c-border)); transition: background-color .3s, border-color .3s; }
+.sidebar-header { padding: 1.5rem 1.25rem; border-bottom: 1px solid rgb(var(--c-border)); }
+.sidebar-header h3 { margin: 0; font-size: 1.5rem; font-weight: 700; color: rgb(var(--color-primary)); }
+.sidebar-nav { padding: 0.75rem; flex-grow: 1; }
+.sidebar-nav a { display: flex; align-items: center; gap: .75rem; padding: .6rem 1rem; color: rgb(var(--c-text-secondary)); text-decoration: none; border-radius: 0.5rem; transition: background-color .2s, color .2s; font-weight: 500; }
+.sidebar-nav a:hover { color: rgb(var(--c-text)); background-color: rgba(var(--c-border), 0.5); }
+.sidebar-nav a.active { color: rgb(var(--c-text-on-primary)); background-color: rgb(var(--color-primary)); }
+.sidebar-nav a.active svg { color: rgb(var(--c-text-on-primary)); }
+.sidebar-nav a svg { color: rgb(var(--c-text-secondary)); }
+.main-content { flex-grow: 1; padding: 2rem 2.5rem; }
+.admin-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
+.admin-header h2 { margin: 0; font-size: 1.875rem; font-weight: 700; }
+#theme-toggle { background: transparent; cursor: pointer; color: rgb(var(--c-text-secondary)); padding: 0.5rem; border-radius: 99px; }
+#theme-toggle:hover { background-color: rgb(var(--c-border)); color: rgb(var(--c-text)); }
 .page { display: none; }
 .page.active { display: block; animation: fadeIn .3s ease-out forwards; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-article, fieldset { border-radius: var(--pico-border-radius); border: 1px solid var(--pico-card-border-color); background: var(--pico-card-background-color); box-shadow: var(--pico-shadow-sm); padding: 2rem; }
-dialog article { box-shadow: var(--pico-shadow-lg); }
-legend { font-size: 1.25rem; font-weight: 600; padding: 0 .5rem; }
-.domain-card { background-color: var(--pico-card-background-color); border: 1px solid var(--pico-card-border-color); border-radius: var(--pico-border-radius); padding: 1.5rem; display: grid; grid-template-columns: 2fr 1.5fr 1fr auto; gap: 1.5rem; align-items: center; transition: box-shadow .2s ease, transform .2s ease; margin-bottom: 1rem; }
+article, fieldset { border: 1px solid rgb(var(--c-border)); background-color: rgb(var(--c-card-bg)); box-shadow: var(--shadow-sm); padding: 2rem; border-radius: var(--radius); margin-bottom: 1.5rem; }
+dialog { max-width: 560px; border-radius: var(--radius); border: 1px solid rgb(var(--c-border)); padding: 0; box-shadow: var(--shadow-lg); background-color: rgb(var(--c-card-bg)); color: rgb(var(--c-text)); }
+dialog::backdrop { background-color: rgba(0,0,0,0.5); backdrop-filter: blur(4px); }
+dialog article { box-shadow: none; border: none; padding: 1.5rem; }
+dialog header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 1rem; border-bottom: 1px solid rgb(var(--c-border)); }
+dialog h3 { font-size: 1.25rem; font-weight: 600; margin: 0; }
+dialog .close { display: block; padding: 0.25rem; color: rgb(var(--c-text-secondary)); text-decoration: none; }
+dialog form { margin-top: 1.5rem; }
+dialog footer { margin-top: 2rem; display: flex; justify-content: flex-end; gap: 0.75rem; }
+legend { font-size: 1.125rem; font-weight: 600; padding: 0 .5rem; display: flex; align-items: center; gap: 0.5rem; }
+.domain-card { background-color: rgb(var(--c-card-bg)); border: 1px solid rgb(var(--c-border)); border-radius: var(--radius); padding: 1.25rem; display: grid; grid-template-columns: 2fr 1.5fr 1fr auto; gap: 1.5rem; align-items: center; transition: box-shadow .2s, border-color .2s; margin-bottom: 1rem; }
+.domain-card:hover { border-color: rgba(var(--color-primary), 0.5); box-shadow: var(--shadow-md); }
 .card-col { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; }
-.card-col strong { display: flex; align-items: center; font-size: 0.75rem; color: #6c757d; margin-bottom: .25rem; text-transform: uppercase; font-weight: 600; letter-spacing: 0.05em; }
-.card-col .domain-cell { font-size: 1rem; font-weight: 500; color: #212529; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
-.card-col small.domain-cell { color: #6c757d; font-weight: 400; }
+.card-col strong { font-size: 0.75rem; color: rgb(var(--c-text-secondary)); margin-bottom: .25rem; text-transform: uppercase; font-weight: 600; letter-spacing: 0.05em; display: inline-flex; align-items: center; gap: 0.25rem; }
+.card-col .domain-cell { font-size: 1rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.card-col small.domain-cell { color: rgb(var(--c-text-secondary)); font-weight: 400; }
 .card-actions { display: flex; justify-content: flex-end; gap: .5rem; }
 .record-details summary { display: inline-flex; align-items: center; cursor: pointer; user-select: none; list-style: none; font-weight: 500; }
 .record-details ul { margin: 8px 0 0; padding-left: 20px; font-size: 0.9em; }
-.refresh-icon { cursor: pointer; margin-left: 8px; color: var(--pico-primary-light); transition: color .2s; }
-.refresh-icon:hover { color: var(--pico-primary); }
-.status-success { color: #198754; } .status-failed { color: #dc3545; } .status-no_change { color: #6c757d; }
+.refresh-icon { cursor: pointer; color: rgb(var(--c-text-secondary)); transition: color .2s; }
+.refresh-icon:hover { color: rgb(var(--color-primary)); }
+.status-success { color: #10b981; } .status-failed { color: #f43f5e; } .status-no_change { color: rgb(var(--c-text-secondary)); }
 .notifications { position: fixed; top: 20px; right: 20px; z-index: 1050; display: flex; flex-direction: column; gap: 10px; }
-.toast { background-color: #333; color: #fff; padding: 15px 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); opacity: 0; transform: translateX(100%); transition: opacity 0.4s ease-in-out, transform 0.4s ease-in-out; max-width: 350px; font-weight: 500; }
+.toast { background-color: #333; color: #fff; padding: 15px 20px; border-radius: 8px; box-shadow: var(--shadow-lg); opacity: 0; transform: translateX(100%); transition: opacity 0.4s, transform 0.4s; max-width: 350px; font-weight: 500; }
 .toast.show { opacity: 1; transform: translateX(0); }
 .toast.hide { opacity: 0; transform: translateX(100%); }
-.toast-success { background-color: #28a745; }
-.toast-error { background-color: #dc3545; }
-.toast-warning { background-color: #ffc107; color: #212529; }
-.toast-info { background-color: #17a2b8; }
-.public-nav {
-  position: sticky;
-  top: 1rem;
-  max-width: 1200px;
-  margin: 0 auto 2rem auto;
-  padding: 0.75rem 1rem;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  background: var(--c-bg-blur);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border: 1px solid var(--c-card-border);
-  border-radius: var(--pico-border-radius);
-  box-shadow: var(--pico-shadow-md);
-  z-index: 100;
-}
-.public-nav-title { font-size: 1.25rem; font-weight: 600; color: var(--c-text); }
-.public-nav-actions { display: flex; align-items: center; gap: 1rem; }
-.public-nav-actions a, .public-nav-actions button {
-  text-decoration: none;
-  padding: 0.5rem 1rem;
-  border-radius: 8px;
-  font-weight: 500;
-  transition: all 0.2s ease;
-  border: none;
-}
-.public-nav-actions a { background-color: var(--c-button-bg); color: var(--c-button-text); }
-.public-nav-actions a:hover { filter: brightness(1.1); }
-.subscription-buttons { display: flex; gap: 0.5rem; }
-.subscription-buttons button { padding: 0.5rem 0.8rem; font-size: 0.9rem; background-color: transparent; border: 1px solid var(--c-button-bg); color: var(--c-text-accent); }
-.subscription-buttons button:hover { background-color: var(--c-button-bg); color: var(--c-button-text); }
-.public-container { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
-.public-section h2 { font-size: 1.75rem; margin-bottom: 2rem; display: flex; align-items: center; gap: 0.75rem; color: var(--c-text); border: none; padding: 0;}
-.public-section h2::before { content: ''; display: block; width: 5px; height: 1.25rem; background-color: var(--c-primary); border-radius: 3px; }
-.public-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1.5rem; }
-.public-card {
-  background: var(--c-card-bg);
-  backdrop-filter: blur(5px);
-  -webkit-backdrop-filter: blur(5px);
-  border: 1px solid var(--c-card-border);
-  border-radius: var(--pico-border-radius);
-  box-shadow: var(--pico-shadow-md);
-  padding: 1.5rem;
-  cursor: pointer;
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
-}
-.public-card:hover { transform: translateY(-5px); box-shadow: var(--pico-shadow-lg); }
-.public-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
-.public-card-title { font-size: 1.1rem; font-weight: 600; color: var(--c-text); margin: 0; }
-.public-card-meta { font-size: 0.8rem; color: var(--c-text-muted); white-space: nowrap; }
-.public-card-content { font-family: "SF Mono", "Consolas", "Menlo", monospace; font-size: 1rem; color: var(--c-text-accent); word-break: break-all; }
-.public-card-footer { font-size: 0.85rem; color: var(--c-text-muted); display: flex; align-items: center; gap: 0.5rem; }
-.home-toast { position: fixed; top: 80px; right: 20px; background-color: var(--c-primary); color: #fff; padding: 12px 20px; border-radius: 6px; z-index: 1000; font-weight: 500; box-shadow: var(--pico-shadow-lg); transition: transform 0.4s ease-in-out, opacity 0.4s ease-in-out; transform: translateY(-100px); opacity: 0; }
-.home-toast.show { transform: translateY(0); opacity: 1; }
-.home-toast.hide { transform: translateY(50px); opacity: 0; }
-.snippets-help-btn { margin-left: .5rem; cursor: pointer; font-size: .8em; font-weight: normal; }
-.code-block { background-color: #f5f5f5; border: 1px solid #ddd; border-radius: 4px; padding: 1rem; margin-top: 1rem; position: relative; }
-.code-block-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: .5rem; }
-.code-block-title { font-weight: bold; }
-.copy-btn { padding: .25rem .5rem; font-size: .8rem; }
-.line-numbers { float: left; text-align: right; margin-right: 1rem; padding-right: 1rem; border-right: 1px solid #ddd; user-select: none; color: #999; }
-.auth-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 1rem; width: 100%;}
-.auth-container article { max-width: 480px; width: 100%;}
-
+.toast-success { background-color: #28a745; } .toast-error { background-color: #dc3545; } .toast-warning { background-color: #ffc107; color: #212529; } .toast-info { background-color: #17a2b8; }
+.auth-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 1rem; width: 100%; }
+.auth-container article { max-width: 480px; width: 100%; }
+label { font-weight: 500; margin-bottom: .5rem; display: block; }
+input, select, textarea { font-family: inherit; font-size: 100%; width: 100%; padding: .6rem .8rem; margin: 0; border-radius: .5rem; border: 1px solid rgb(var(--c-border)); background-color: rgb(var(--c-bg)); color: inherit; transition: border-color .2s, box-shadow .2s; }
+input:focus, select:focus, textarea:focus { outline: 2px solid transparent; outline-offset: 2px; box-shadow: 0 0 0 2px rgb(var(--c-bg)), 0 0 0 4px rgb(var(--color-primary)); border-color: rgb(var(--color-primary)); }
+input::placeholder, textarea::placeholder { color: rgb(var(--c-text-secondary), 0.7); }
+html.dark input::placeholder, html.dark textarea::placeholder { color: rgb(var(--c-text-secondary), 0.5); }
+button { cursor: pointer; font-weight: 600; padding: .6rem 1.2rem; border-radius: .5rem; border: 1px solid transparent; }
+button[type=submit], button:not(.outline,.secondary,.contrast) { background-color: rgb(var(--color-primary)); color: rgb(var(--c-text-on-primary)); }
+button[type=submit]:hover, button:not(.outline,.secondary,.contrast):hover { background-color: rgb(var(--color-primary-hover)); }
+button.secondary { background-color: rgb(var(--c-sidebar-bg)); color: rgb(var(--c-text)); border: 1px solid rgb(var(--c-border)); }
+button.contrast { background: transparent; border-color: rgb(var(--c-border)); }
+button.outline { background: transparent; border-color: rgb(var(--color-primary)); color: rgb(var(--color-primary)); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button[aria-busy=true] { color: transparent !important; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.form-group { margin-bottom: 1.5rem; }
+.form-control-inline { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
+.form-control-inline input[type="checkbox"], .form-control-inline input[type="radio"] { width: auto; flex-shrink: 0; }
+.sub-item-row { display: flex; flex-direction: column; gap: 0.75rem; padding-top: 1rem; border-top: 1px solid rgb(var(--c-border)); }
+.sub-item-row:first-child { border-top: none; padding-top: 0; }
+.sub-item-controls { display: flex; align-items: center; gap: 1rem; }
+.sub-item-controls .ext-sub-result { flex-grow: 1; font-size: 0.875rem; }
+.filter-options-grid { display: flex; flex-wrap: wrap; gap: 1.5rem; margin-bottom: 1rem; }
 @media (max-width: 768px) {
-  .public-nav { top: 0; left: 0; right: 0; border-radius: 0; width: 100%; flex-wrap: wrap; padding-bottom: 0; }
-  .public-nav-title, .public-nav-actions { width: 50%; }
-  .public-nav-actions { justify-content: flex-end; }
-  .subscription-buttons-container-mobile { padding: 0.75rem 1rem; width: 100%; order: 3; }
-  .subscription-buttons { justify-content: center; }
-  .public-container { padding: 1rem; }
-  .public-grid { grid-template-columns: 1fr; }
-  main.container {
-      display: block;
-  }
-  .sidebar {
-      width: 100%;
-      height: auto;
-      position: static;
-      border-right: none;
-      border-bottom: 1px solid var(--pico-card-border-color);
-  }
-  .main-content {
-      padding: 1.5rem 1rem;
-  }
-  .page-header {
-      flex-direction: column;
-      gap: 1rem;
-      align-items: flex-start;
-  }
-  .page-header h2 {
-      font-size: 1.75rem;
-  }
-  .domain-card {
-      grid-template-columns: 1fr;
-      gap: 1rem;
-      padding: 1rem;
-  }
-  .card-actions {
-      flex-direction: row;
-      justify-content: flex-start;
-      flex-wrap: wrap;
-  }
+  .sidebar { width: 100%; height: auto; position: static; border-right: none; border-bottom: 1px solid rgb(var(--c-border)); flex-direction: row; align-items: center; }
+  .sidebar-header { border: none; padding: 0.5rem 1rem; } .sidebar-header h3 { font-size: 1.25rem; }
+  .sidebar-nav { display: flex; gap: 0.25rem; padding: 0.5rem; overflow-x: auto; -ms-overflow-style: none; scrollbar-width: none; }
+  .sidebar-nav::-webkit-scrollbar { display: none; }
+  .sidebar-nav a { padding: 0.5rem 0.75rem; } .sidebar-nav a .icon { width: 1rem; height: 1rem; } .sidebar-nav a span { display: none; }
+  main.container { display: block; }
+  .main-content { padding: 1.5rem 1rem; }
+  .admin-header h2 { font-size: 1.5rem; }
+  .domain-card { grid-template-columns: 1fr; gap: 1rem; padding: 1rem; }
+  .card-actions { flex-direction: row; justify-content: flex-start; flex-wrap: wrap; }
 }
 </style></head><body><main class="container">${content}</main><div id="notifications"></div></body></html>`; }
 
@@ -1289,7 +1168,8 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
           </div>
           <div class="public-card-content">${d.target_domain}</div>
           <div class="public-card-footer">
-              <i class="fa-solid fa-link fa-xs"></i> <span>来源: ${sourceHost}</span>
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.72"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.72"/></svg>
+              <span>来源: ${sourceHost}</span>
           </div>
       </div>`;
       
@@ -1315,7 +1195,8 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
                           </div>
                           <div class="public-card-content">${singleDomain}</div>
                           <div class="public-card-footer">
-                              <i class="fa-solid fa-link fa-xs"></i> <span>来源: ${sourceHost}</span>
+                                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.72"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.72"/></svg>
+                              <span>来源: ${sourceHost}</span>
                           </div>
                       </div>`;
                       cards.push(singleCard);
@@ -1338,174 +1219,316 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
           </div>
           <div class="public-card-content">${fullUrl}</div>
           <div class="public-card-footer">
-              <i class="fa-solid fa-link fa-xs"></i> <span>来源: ${new URL(s.url).hostname}</span>
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.72"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.72"/></svg>
+              <span>来源: ${new URL(s.url).hostname}</span>
           </div>
       </div>`;
   }).join('');
 
   const authButton = loggedIn 
-      ? `<a href="/admin" role="button">进入后台</a>`
-      : `<button class="outline" onclick="document.getElementById('login-modal').showModal()">登录</button>`;
+      ? `<a href="/admin" class="icon-btn" aria-label="Admin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2-2h-.09a1.65 1.65 0 00-1.51 1z"></path></svg></a>`
+      : `<button class="icon-btn" aria-label="Login" onclick="document.getElementById('login-modal').showModal()"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg></button>`;
   
   const subscriptionButtonsHTML = (proxySettings.publicSubscription && proxySettings.enableWsReverseProxy) ? `
-      <div class="subscription-buttons" id="sub-buttons-desktop">
-          <button data-sub-type="xray">${_k(['X','ray'])}</button>
-          <button data-sub-type="clash">${_k(['Cla','sh'])}</button>
-          <button data-sub-type="singbox">${_k(['Sing','-Box'])}</button>
-          <button data-sub-type="surge">${_k(['Sur','ge'])}</button>
-      </div>
-      <div class="subscription-buttons-container-mobile" id="sub-buttons-mobile-container" style="display: none;">
-          <div class="subscription-buttons" id="sub-buttons-mobile">
-              <button data-sub-type="xray">${_k(['X','ray'])}</button>
-              <button data-sub-type="clash">${_k(['Cla','sh'])}</button>
-              <button data-sub-type="singbox">${_k(['Sing','-Box'])}</button>
-              <button data-sub-type="surge">${_k(['Sur','ge'])}</button>
-          </div>
-      </div>
+      <button class="timer-nav-item" data-sub-type="xray">${_k(['X','ray'])}</button>
+      <button class="timer-nav-item" data-sub-type="clash">${_k(['Cla','sh'])}</button>
+      <button class="timer-nav-item" data-sub-type="singbox">${_k(['Sing','-Box'])}</button>
+      <button class="timer-nav-item" data-sub-type="surge">${_k(['Sur','ge'])}</button>
   ` : '';
 
   return `
-  <div class="public-body-wrapper">
-      <div class="background-blurs">
-          <div class="blur-orb blur-orb-1"></div>
-          <div class="blur-orb blur-orb-2"></div>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CF-DNS-Clone</title>
+  <style>
+    :root {
+      --bg-gradient: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+      --glass-bg: rgba(255, 255, 255, 0.2);
+      --glass-border: rgba(255, 255, 255, 0.3);
+      --text-color: #333333;
+      --primary-color: #10b981;
+      --glow-color: rgba(0, 0, 0, 0.05);
+      --top-bar-shadow: 0 10px 35px rgba(0, 0, 0, 0.15);
+      --top-bar-highlight: inset 0 1px 1px rgba(255, 255, 255, 0.5);
+      --transition-curve: cubic-bezier(0.4, 0, 0.2, 1);
+      --mouse-x: 50%;
+      --mouse-y: 50%;
+      --pico-font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;
+      --pico-border-radius: 12px;
+      --pico-shadow-md: 0 4px 12px rgba(0,0,0,0.1);
+      --pico-shadow-lg: 0 10px 30px rgba(0,0,0,0.1);
+      --c-card-bg: rgba(255, 255, 255, 0.6);
+      --c-card-border: rgba(255, 255, 255, 0.9);
+      --c-text-muted: #6c757d;
+      --c-text-accent: var(--primary-color);
+    }
+    body.dark {
+      --bg-gradient: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+      --glass-bg: rgba(10, 15, 30, 0.5);
+      --glass-border: rgba(255, 255, 255, 0.1);
+      --text-color: #e5e7eb;
+      --primary-color: #3b82f6;
+      --glow-color: rgba(255, 255, 255, 0.05);
+      --top-bar-shadow: 0 10px 35px rgba(0, 0, 0, 0.3);
+      --top-bar-highlight: inset 0 1px 1px rgba(255, 255, 255, 0.1);
+      --c-card-bg: rgba(44, 44, 46, 0.5);
+      --c-card-border: rgba(255, 255, 255, 0.1);
+      --c-text-muted: #8e8e93;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: var(--pico-font-family);
+      min-height: 100vh; color: var(--text-color);
+      transition: color 0.5s var(--transition-curve), background 0.8s var(--transition-curve);
+      overflow-x: hidden; background-color: #111;
+    }
+    body::before {
+      content: ''; position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: var(--bg-gradient); background-size: 200% 200%;
+      animation: aurora-flow 15s ease infinite; z-index: -1;
+    }
+    @keyframes aurora-flow { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+    .top-bar-container { position: sticky; top: 0; z-index: 50; padding: 1rem 2rem; }
+    .top-bar {
+      display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+      background: var(--glass-bg); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--glass-border); border-radius: 9999px;
+      padding: 0.5rem 0.75rem; box-shadow: var(--top-bar-shadow), var(--top-bar-highlight);
+      transition: all 0.5s var(--transition-curve);
+    }
+    .top-bar-left { flex-shrink: 0; }
+    .top-bar-left .nav-title {
+      font-size: 1.5rem; font-weight: 700; padding: 0 1rem;
+      background: linear-gradient(135deg, var(--primary-color), var(--text-color));
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      transition: all 0.5s var(--transition-curve);
+    }
+    .top-bar-center { flex: 1; display: flex; justify-content: center; align-items: center; gap: 0.25rem; overflow: hidden; }
+    .top-bar-right { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
+    .icon-btn { background: transparent; border: 1px solid transparent; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--text-color); transition: all 0.3s var(--transition-curve); text-decoration: none; }
+    .icon-btn:hover { background: rgba(255,255,255,0.1); }
+    body:not(.dark) .icon-btn:hover { background: rgba(0,0,0,0.05); }
+    .icon-btn svg { width: 20px; height: 20px; stroke-width: 2; }
+    .timer-nav-item { 
+      padding: 0.5rem 1rem; border-radius: 9999px; font-size: 0.875rem; font-weight: 600; white-space: nowrap; cursor: pointer; 
+      transition: all 0.3s var(--transition-curve); background-color: transparent; border: none; color: var(--text-color);
+      text-shadow: 0 1px 2px rgba(0,0,0,0.1);
+    }
+    .timer-nav-item:hover { background: rgba(255,255,255,0.1); transform: translateY(-1px); }
+    body:not(.dark) .timer-nav-item:hover { background: rgba(0,0,0,0.05); }
+    
+    .public-container { max-width: 1200px; margin: 1rem auto; padding: 1.5rem; }
+    .public-section h2 { color: var(--text-color); font-size: 1.75rem; margin-bottom: 2rem; display: flex; align-items: center; gap: 0.75rem; border: none; padding: 0;}
+    .public-section h2 .icon { color: var(--primary-color); }
+    .public-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1.5rem; }
+    .public-card {
+        background: var(--c-card-bg); backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
+        border: 1px solid var(--c-card-border); border-radius: var(--pico-border-radius); box-shadow: var(--pico-shadow-md);
+        padding: 1.5rem; cursor: pointer; transition: transform 0.2s ease, box-shadow 0.2s ease;
+        display: flex; flex-direction: column; gap: 1rem;
+    }
+    .public-card svg { color: var(--c-text-muted); }
+    .public-card:hover { transform: translateY(-5px); box-shadow: var(--pico-shadow-lg); }
+    .public-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+    .public-card-title { font-size: 1.1rem; font-weight: 600; color: var(--text-color); margin: 0; }
+    .public-card-meta { font-size: 0.8rem; color: var(--c-text-muted); white-space: nowrap; }
+    .public-card-content { font-family: "SF Mono", "Consolas", "Menlo", monospace; font-size: 1rem; color: var(--c-text-accent); word-break: break-all; }
+    .public-card-footer { font-size: 0.85rem; color: var(--c-text-muted); display: flex; align-items: center; gap: 0.5rem; }
+    
+    #toast-container { position: fixed; top: 80px; right: 20px; z-index: 999999; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
+    .home-toast { color: #fff; padding: 12px 20px; border-radius: 8px; font-weight: 500; box-shadow: var(--pico-shadow-lg); transition: transform 0.4s ease-in-out, opacity 0.4s ease-in-out; transform: translateY(-100px) translateX(20px) scale(0.9); opacity: 0; }
+    .home-toast.show { transform: translateY(0) translateX(0) scale(1); opacity: 1; }
+    
+    dialog { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; border: none; border-radius: 16px; background: var(--glass-bg); backdrop-filter: blur(25px); -webkit-backdrop-filter: blur(25px); color: var(--text-color); padding: 0; box-shadow: var(--pico-shadow-lg); z-index: 999998; }
+    dialog::backdrop { background: rgba(0,0,0,0.5); backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px); }
+    dialog article { padding: 2.5rem; background: transparent; border: none; box-shadow: none; }
+    dialog header { margin-bottom: 1.5rem; text-align: center; }
+    dialog h3 { font-size: 1.75rem; font-weight: 700; margin: 0; }
+    .close-btn { position: absolute; top: 1rem; right: 1rem; background: none; border: none; color: var(--text-color); font-size: 1.5rem; cursor: pointer; opacity: 0.7; }
+    dialog .form-group { margin-bottom: 1.5rem; }
+    dialog input { background: rgba(0,0,0,0.2); border: 1px solid var(--glass-border); color: var(--text-color); width: 100%; padding: 0.8rem 1rem; border-radius: 12px; font-size: 1rem; }
+    dialog input::placeholder { color: var(--c-text-muted); }
+    dialog button[type="submit"] { background: var(--primary-color); color: white; border: none; width: 100%; padding: 0.9rem; border-radius: 999px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.3s; }
+    dialog button[type="submit"]:hover { filter: brightness(1.1); }
+    
+    .glow-card { position: relative; overflow: hidden; }
+    .glow-card::before { content: ''; position: absolute; left: var(--mouse-x); top: var(--mouse-y); width: 250px; height: 250px; background: radial-gradient(circle, var(--glow-color) 0%, transparent 80%); transform: translate(-50%, -50%); opacity: 0; transition: opacity 0.5s var(--transition-curve); pointer-events: none; }
+    .glow-card:hover::before { opacity: 1; }
+    
+    @media (max-width: 768px) { 
+      .top-bar-container { padding: 0.5rem; } 
+      .top-bar { flex-wrap: wrap; padding: 0.5rem 1rem; border-radius: 24px; position: relative; min-height: auto; }
+      .top-bar-left { flex-grow: 1; display: flex; align-items: center; }
+      .top-bar-right { position: absolute; top: 0.5rem; right: 0.75rem; gap: 0.25rem;}
+      .top-bar-center { flex-basis: 100%; order: 3; justify-content: center; gap: 0.1rem; padding-top: 0.5rem; }
+      .top-bar-left .nav-title { font-size: 1.25rem; padding: 0; } 
+      .timer-nav-item { padding: 0.4rem 0.6rem; font-size: 0.8rem; }
+      .public-container { margin-top: 1rem; }
+      .public-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div id="toast-container"></div>
+  <div class="top-bar-container">
+    <header class="top-bar glow-card">
+      <div class="top-bar-left"><h1 class="nav-title">CF-DNS-Clone</h1></div>
+      <div class="top-bar-center">${subscriptionButtonsHTML}</div>
+      <div class="top-bar-right">
+        <button class="icon-btn" id="darkToggle" aria-label="Toggle Theme"></button>
+        ${authButton}
       </div>
-      <nav class="public-nav">
-          <div class="public-nav-title">CF-DNS-Clon</div>
-          ${subscriptionButtonsHTML}
-          <div class="public-nav-actions">
-              ${authButton}
-          </div>
-      </nav>
-      <div class="public-container">
-          <section class="public-section">
-              <h2><i class="fa-solid fa-globe"></i> 优选域名</h2>
-              <div class="public-grid">${domainCards || '<p>暂无可用数据</p>'}</div>
-          </section>
-          <section class="public-section">
-              <h2><i class="fa-solid fa-server"></i> 优选API</h2>
-              <div class="public-grid">${ipSourceCards || '<p>暂无可用数据</p>'}</div>
-          </section>
-      </div>
+    </header>
   </div>
-  <div id="copy-toast" class="home-toast"></div>
+  
+  <main class="public-container">
+      <section class="public-section">
+          <h2><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2Z"/><path d="M12 12a10 10 0 0 0-3.45 1.87L12 17l3.45-3.13A10 10 0 0 0 12 12Z"/><path d="m13.89 12.2-.44-3.56.9-1.56-2.9-1.5-1.4 2.37.23 3.65 3.61.6Z"/></svg> 优选域名</h2>
+          <div class="public-grid">${domainCards || '<p>暂无可用数据</p>'}</div>
+      </section>
+      <section class="public-section">
+          <h2><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="20" x="2" y="2" rx="2" ry="2"/><line x1="8" x2="16" y1="6" y2="6"/><line x1="8" x2="16" y1="12" y2="12"/><line x1="8" x2="13" y1="18" y2="18"/></svg> 优选API</h2>
+          <div class="public-grid">${ipSourceCards || '<p>暂无可用数据</p>'}</div>
+      </section>
+  </main>
   
   <dialog id="login-modal">
   <article>
+      <button class="close-btn" aria-label="Close" onclick="document.getElementById('login-modal').close()">×</button>
       <header>
-      <a href="#close" aria-label="Close" class="close" onclick="document.getElementById('login-modal').close()"></a>
-      <h3>管理员登录</h3>
+        <h3>管理员登录</h3>
       </header>
-      <p>请输入密码以继续。</p>
       <form id="modal-login-form">
-      <label for="modal-password">密码</label>
-      <input type="password" id="modal-password" name="password" required>
-      <p id="modal-error-msg" style="color: var(--pico-color-red-500); height: 1em;"></p>
-      <button type="submit">登录</button>
+        <div class="form-group">
+          <input type="password" id="modal-password" name="password" required placeholder="请输入密码">
+        </div>
+        <button type="submit">登录</button>
       </form>
   </article>
   </dialog>
 
   <script>
-      const _k = (p) => p.join('');
-      let currentSettings = ${JSON.stringify({proxySettings})};
-      const toast = document.getElementById('copy-toast');
+    const _k = (p) => p.join('');
+    const root = document.documentElement;
+    const body = document.body;
+    let isDark = false;
+
+    document.addEventListener('mousemove', e => {
+        root.style.setProperty('--mouse-x', e.clientX + 'px');
+        root.style.setProperty('--mouse-y', (e.clientY + window.scrollY) + 'px');
+    });
+
+    const darkToggle = document.getElementById('darkToggle');
+    const moonIcon = \`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"></path></svg>\`;
+    const sunIcon = \`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>\`;
+
+    function updateTheme() {
+        darkToggle.innerHTML = isDark ? sunIcon : moonIcon;
+        body.classList.toggle('dark', isDark);
+    }
+    
+    darkToggle.addEventListener('click', () => {
+        isDark = !isDark;
+        updateTheme();
+    });
+
+    function setInitialMode() {
+        const now = new Date();
+        const utcHour = now.getUTCHours();
+        const beijingHour = (utcHour + 8) % 24;
+        isDark = !(beijingHour >= 7 && beijingHour < 19);
+        updateTheme();
+    }
+    
+    setInitialMode();
+
+    const toastContainer = document.getElementById('toast-container');
+    const toastColors = ['#e0f7fa', '#e8f5e9', '#fffde7', '#fbe9e7', '#f3e5f5', '#e3f2fd'];
+    function showToast(message, isError = false) {
+        const toast = document.createElement('div');
+        toast.className = 'home-toast';
+        toast.textContent = message;
+        if(isError) {
+            toast.style.backgroundColor = '#dc3545';
+            toast.style.color = 'white';
+        } else {
+            const randomColor = toastColors[Math.floor(Math.random() * toastColors.length)];
+            toast.style.backgroundColor = randomColor;
+            toast.style.color = '#333';
+        }
+        toastContainer.appendChild(toast);
+        setTimeout(() => toast.classList.add('show'), 10);
+        setTimeout(() => { 
+          toast.classList.remove('show');
+          toast.addEventListener('transitionend', () => toast.remove());
+        }, 3000);
+    }
+
+    document.querySelector('.public-container').addEventListener('click', (event) => {
+        const card = event.target.closest('.public-card');
+        if (card && card.dataset.copyContent) {
+            navigator.clipboard.writeText(card.dataset.copyContent).then(() => {
+                showToast('已复制: ' + card.dataset.copyContent);
+            }, () => {
+                showToast('复制失败！', true);
+            });
+        }
+    });
       
-      function showToast(message) {
-          toast.textContent = message;
-          toast.classList.add('show');
-          setTimeout(() => {
-              toast.classList.remove('show');
-              toast.classList.add('hide');
-              setTimeout(() => toast.classList.remove('hide'), 400);
-          }, 2000);
-      }
+    const loginForm = document.getElementById('modal-login-form');
+    if (loginForm) {
+        loginForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const password = document.getElementById('modal-password').value;
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                if (!res.ok) { throw new Error((await res.json()).error || '登录失败'); }
+                document.getElementById('login-modal').close();
+                showToast('登录成功，正在跳转...');
+                setTimeout(() => window.location.href = '/admin', 1500);
+            } catch (e) {
+                showToast(e.message, true);
+            }
+        });
+    }
 
-      document.querySelector('.public-container').addEventListener('click', (event) => {
-          const card = event.target.closest('.public-card');
-          if (card && card.dataset.copyContent) {
-              const content = card.dataset.copyContent;
-              navigator.clipboard.writeText(content).then(() => {
-                  showToast('已复制: ' + content);
-              }, () => {
-                  showToast('复制失败！');
-              });
-          }
-      });
-      
-      document.getElementById('modal-login-form').addEventListener('submit', async (e) => {
-          e.preventDefault();
-          const password = document.getElementById('modal-password').value;
-          const errorMsg = document.getElementById('modal-error-msg');
-          const submitBtn = e.target.querySelector('button');
-          errorMsg.textContent = '';
-          submitBtn.setAttribute('aria-busy', 'true');
-          try {
-              const res = await fetch('/api/login', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ password })
-              });
-              if (!res.ok) {
-                  const err = await res.json();
-                  throw new Error(err.error || '登录失败');
-              }
-              window.location.href = '/admin';
-          } catch (e) {
-              errorMsg.textContent = e.message;
-          } finally {
-              submitBtn.removeAttribute('aria-busy');
-          }
-      });
-
-      function setupSubscriptionButtons() {
-          function generateAndCopySubLink(subType) {
-              const ps = currentSettings.proxySettings || {};
-              let subId;
-              if (ps.subUseRandomId) {
-                  const len = ps.subIdLength || 12;
-                  const charset = ps.subIdCharset || 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-                  subId = Array.from({length: len}, () => charset.charAt(Math.floor(Math.random() * charset.length))).join('');
-              } else {
-                  subId = ps.subCustomId || '';
-                  if (!subId) {
-                      showToast("请在后台设置自定义ID");
-                      return;
-                  }
-              }
-              const finalUrl = \`\${window.location.origin}/\${subId}/\${subType}\`;
-              navigator.clipboard.writeText(finalUrl).then(() => {
-                  showToast(\`\${subType.charAt(0).toUpperCase() + subType.slice(1)} ${_k(['订','阅'])}已复制\`);
-              }).catch(err => {
-                  showToast('复制失败!');
-              });
-          }
-          document.querySelectorAll('.subscription-buttons button').forEach(btn => {
-              btn.addEventListener('click', (e) => {
-                  generateAndCopySubLink(e.target.dataset.subType);
-              });
-          });
-
-          function handleResize() {
-              const mobileContainer = document.getElementById('sub-buttons-mobile-container');
-              const desktopContainer = document.getElementById('sub-buttons-desktop');
-              if (window.innerWidth <= 768) {
-                  if (mobileContainer) mobileContainer.style.display = 'block';
-                  if (desktopContainer) desktopContainer.style.display = 'none';
-              } else {
-                  if (mobileContainer) mobileContainer.style.display = 'none';
-                  if (desktopContainer) desktopContainer.style.display = 'flex';
-              }
-          }
-          window.addEventListener('resize', handleResize);
-          handleResize();
-      }
-      if (document.querySelector('.subscription-buttons')) {
-          setupSubscriptionButtons();
-      }
-
+    const subscriptionButtons = document.querySelectorAll('.timer-nav-item[data-sub-type]');
+    if (subscriptionButtons.length > 0) {
+        let currentSettings = ${JSON.stringify({proxySettings})};
+        function generateAndCopySubLink(subType) {
+            const ps = currentSettings.proxySettings || {};
+            let subId;
+            if (ps.subUseRandomId) {
+                const len = ps.subIdLength || 12;
+                const charset = ps.subIdCharset || 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+                subId = Array.from({length: len}, () => charset.charAt(Math.floor(Math.random() * charset.length))).join('');
+            } else {
+                subId = ps.subCustomId || '';
+                if (!subId) { showToast("请在后台设置自定义ID", true); return; }
+            }
+            const finalUrl = \`\${window.location.origin}/\${subId}/\${subType}\`;
+            navigator.clipboard.writeText(finalUrl).then(() => {
+                showToast(\`\${subType.charAt(0).toUpperCase() + subType.slice(1)} ${_k(['订','阅'])}已复制\`);
+            }).catch(err => {
+                showToast('复制失败!', true);
+            });
+        }
+        subscriptionButtons.forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                generateAndCopySubLink(e.target.dataset.subType);
+            });
+        });
+    }
   </script>
-  `;
+</body>
+</html>`;
 }
 
 function getProxySettingsPageHTML() {
@@ -1521,14 +1544,17 @@ function getProxySettingsPageHTML() {
 
           <fieldset>
               <legend>
-                  <i class="fa-solid fa-bolt"></i> ${_k(['代','理','参','数'])}
+                  <svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2z"></polygon></svg>
+                  ${_k(['代','理','参','数'])}
                   <a class="snippets-help-btn" onclick="window.openModal('snippetsModal')">( 如何部署 Snippets 呢？)</a>
               </legend>
-              <label for="enableWsReverseProxy">
-                  <input type="checkbox" id="enableWsReverseProxy" name="enableWsReverseProxy" role="switch">
-                  <strong>你的 workers 或 Snippets</strong>
-              </label>
-              <div id="wsReverseProxyConfig" style="display: none; margin-top: 1.5rem; border-left: 2px solid var(--pico-primary); padding-left: 1.5rem;">
+              <div class="form-group">
+                  <label class="form-control-inline">
+                      <input type="checkbox" id="enableWsReverseProxy" name="enableWsReverseProxy" role="switch">
+                      <span>你的 workers 或 Snippets</span>
+                  </label>
+              </div>
+              <div id="wsReverseProxyConfig" style="display: none; margin-top: 1rem; border-left: 2px solid rgb(var(--color-primary)); padding-left: 1.5rem;">
                   <div class="form-group">
                       <label for="wsReverseProxyUrl">workers 或 Snippets 地址:</label>
                       <input type="text" id="wsReverseProxyUrl" name="wsReverseProxyUrl" placeholder="例如: https://example.com">
@@ -1562,26 +1588,25 @@ function getProxySettingsPageHTML() {
                       </select>
                   </div>
                   <div class="grid">
-                      <div>
-                          <label>
-                              <input type="radio" name="proxyUuidOption" value="random"> 随机${_k(['U','UID'])}
-                          </label>
-                      </div>
-                      <div>
-                          <label>
-                              <input type="radio" name="proxyUuidOption" id="wsReverseProxyUseSpecificUuid" value="specific"> 指定${_k(['U','UID'])}
-                          </label>
-                      </div>
+                      <label class="form-control-inline">
+                          <input type="radio" name="proxyUuidOption" value="random"> <span>随机${_k(['U','UID'])}</span>
+                      </label>
+                      <label class="form-control-inline">
+                          <input type="radio" name="proxyUuidOption" id="wsReverseProxyUseSpecificUuid" value="specific"> <span>指定${_k(['U','UID'])}</span>
+                      </label>
                   </div>
-                  <div class="form-group" id="wsReverseProxySpecificUuidContainer" style="display:none;">
-                      <label for="wsReverseProxyUuidValue">${_k(['U','UID'])}:</label>
+                  <div class="form-group" id="wsReverseProxySpecificUuidContainer" style="display:none; margin-top: 0.5rem;">
+                      <label for="wsReverseProxyUuidValue" style="display:none;">${_k(['U','UID'])}:</label>
                       <input type="text" id="wsReverseProxyUuidValue" name="wsReverseProxySpecificUuid" placeholder="请输入有效的 ${_k(['U','UID'])}">
                   </div>
               </div>
           </fieldset>
 
           <fieldset>
-              <legend><i class="fa-solid fa-pencil"></i> 自定义节点</legend>
+              <legend>
+                  <svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+                  自定义节点
+              </legend>
               <div class="form-group">
                   <label for="customNodes">每行一个节点 (地址:端口#名称@路径)</label>
                   <textarea id="customNodes" name="customNodes" rows="4" placeholder="1.1.1.1:10086#乌鸦@/?ed=2560\nexample.com:443#示例"></textarea>
@@ -1590,26 +1615,23 @@ function getProxySettingsPageHTML() {
           </fieldset>
 
           <fieldset>
-              <legend><i class="fa-solid fa-cloud-download"></i> 外部${_k(['订','阅'])}</legend>
-              <div class="grid">
-                  <div>
-                      <label>
-                          <input type="radio" name="filterMode" id="filterModeNone" value="none">
-                          不过滤
-                      </label>
-                  </div>
-                  <div>
-                      <label>
-                          <input type="radio" name="filterMode" id="filterModeGlobal" value="global">
-                          过滤规则-全部
-                      </label>
-                  </div>
-                  <div>
-                      <label>
-                          <input type="radio" name="filterMode" id="filterModeIndividual" value="individual">
-                          过滤规则-单个
-                      </label>
-                  </div>
+              <legend>
+                  <svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 15v4c0 1.1.9 2 2 2h14a2 2 0 0 0 2-2v-4M17 9l-5 5-5-5M12 14V3"/></svg>
+                  外部${_k(['订','阅'])}
+              </legend>
+              <div class="filter-options-grid">
+                  <label class="form-control-inline">
+                      <input type="radio" name="filterMode" id="filterModeNone" value="none">
+                      <span>不过滤</span>
+                  </label>
+                  <label class="form-control-inline">
+                      <input type="radio" name="filterMode" id="filterModeGlobal" value="global">
+                      <span>过滤规则-全部</span>
+                  </label>
+                  <label class="form-control-inline">
+                      <input type="radio" name="filterMode" id="filterModeIndividual" value="individual">
+                      <span>过滤规则-单个</span>
+                  </label>
               </div>
               <div id="global-filters-container" style="display:none; margin-top:1rem;">
                   <label for="globalFilters">全局过滤规则:</label>
@@ -1620,28 +1642,37 @@ function getProxySettingsPageHTML() {
           </fieldset>
 
           <fieldset>
-              <legend><i class="fa-solid fa-link"></i> ${_k(['订','阅'])}区域</legend>
+              <legend>
+                  <svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.72"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.72"/></svg>
+                  ${_k(['订','阅'])}区域
+              </legend>
               <div class="form-group">
                   <label for="sublinkWorkerUrl">${_k(['订','阅'])}转换 Worker 地址:</label>
                   <input type="text" id="sublinkWorkerUrl" name="sublinkWorkerUrl" placeholder="例如: https://sub.example.com">
               </div>
-              <div class="grid">
-                  <div>
-                      <label for="publicSubscriptionToggle">
-                          <input type="checkbox" id="publicSubscriptionToggle" name="publicSubscription" role="switch">
-                          首页显示${_k(['订','阅'])}
-                      </label>
-                  </div>
+              <div class="form-group">
+                  <label class="form-control-inline">
+                      <input type="checkbox" id="publicSubscriptionToggle" name="publicSubscription" role="switch">
+                      <span>首页显示${_k(['订','阅'])}</span>
+                  </label>
+              </div>
+               <div class="grid">
+                  <label class="form-control-inline">
+                      <input type="radio" name="subIdOption" id="subUseRandomId" value="random">
+                      <span>随机ID</span>
+                  </label>
+                  <label class="form-control-inline">
+                      <input type="radio" name="subIdOption" id="subUseCustomId" value="custom">
+                      <span>自定义ID</span>
+                  </label>
               </div>
               <div class="grid">
-                  <div>
-                      <label><input type="radio" name="subIdOption" id="subUseRandomId" value="random"> 随机ID</label>
+                  <div class="form-group">
                       <label for="subIdLength">长度:</label>
                       <input type="number" id="subIdLength" name="subIdLength" min="1" max="32" value="12">
                   </div>
-                  <div>
-                      <label><input type="radio" name="subIdOption" id="subUseCustomId" value="custom"> 自定义ID</label>
-                      <label for="subCustomId" class="visually-hidden">自定义ID内容</label>
+                  <div class="form-group">
+                      <label for="subCustomId">自定义ID内容:</label>
                       <input type="text" id="subCustomId" name="subCustomId" placeholder="自定义内容">
                   </div>
               </div>
@@ -1675,55 +1706,74 @@ async function getDashboardPage(domains, ipSources, settings) {
   return `<aside class="sidebar">
       <div class="sidebar-header"><h3>DNS Clone</h3></div>
       <nav class="sidebar-nav">
-          <a href="#page-dns-clone" class="nav-link active" data-target="page-dns-clone"><i class="fa-solid fa-clone fa-fw"></i> 域名克隆</a>
-          <a href="#page-github-upload" class="nav-link" data-target="page-github-upload"><i class="fa-brands fa-github fa-fw"></i> GitHub 上传</a>
-          <a href="#page-proxy-settings" class="nav-link" data-target="page-proxy-settings"><i class="fa-solid fa-server fa-fw"></i> ${_k(['代','理'])}设置</a>
-          <a href="#page-settings" class="nav-link" data-target="page-settings"><i class="fa-solid fa-gear fa-fw"></i> 系统设置</a>
+          <a href="#page-dns-clone" class="nav-link active" data-target="page-dns-clone"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg> <span>域名克隆</span></a>
+          <a href="#page-github-upload" class="nav-link" data-target="page-github-upload"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg> <span>GitHub 上传</span></a>
+          <a href="#page-proxy-settings" class="nav-link" data-target="page-proxy-settings"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 4 16.25"></path><path d="M8 16.25a8 8 0 0 0 16 0h-4.26"></path><path d="m18 10-4 4h4V6Z"></path></svg> <span>${_k(['代','理'])}设置</span></a>
+          <a href="#page-settings" class="nav-link" data-target="page-settings"><svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2-2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg> <span>系统设置</span></a>
       </nav>
   </aside>
   <div class="main-content">
       <div id="page-dns-clone" class="page active">
-          <div class="page-header"><h2>域名克隆列表</h2><button id="addDomainBtn" ${settings.CF_ZONE_ID ? '' : 'disabled'}>＋ 添加克隆目标</button></div>
+          <div class="admin-header"><h2>域名克隆列表</h2><button id="addDomainBtn" ${settings.CF_ZONE_ID ? '' : 'disabled'}>＋ 添加克隆目标</button></div>
           <div id="domain-list-container"></div>
           <article><h3>手动操作</h3><p>点击下方按钮，可以立即为所有已启用的目标执行一次同步任务。</p><button id="manualSyncBtn">手动同步所有目标</button><pre id="logOutput" style="display:none;"></pre></article>
       </div>
       <div id="page-github-upload" class="page">
-          <div class="page-header"><h2>GitHub IP源列表</h2><button id="addIpSourceBtn" ${githubSettingsComplete ? '' : 'disabled'}>＋ 添加IP源</button></div>
+          <div class="admin-header"><h2>GitHub IP源列表</h2><button id="addIpSourceBtn" ${githubSettingsComplete ? '' : 'disabled'}>＋ 添加IP源</button></div>
           <div id="ip-source-list-container"></div>
           <article><h3>手动操作</h3><p>点击下方按钮，可以立即为所有已启用的IP源执行一次同步并上传到GitHub。</p><button id="manualSyncIpSourcesBtn">同步所有IP源</button><pre id="ipLogOutput" style="display:none;"></pre></article>
       </div>
       <div id="page-proxy-settings" class="page">
-          <div class="page-header"><h2>${_k(['代','理'])}设置</h2></div>
+          <div class="admin-header"><h2>${_k(['代','理'])}设置</h2></div>
           ${getProxySettingsPageHTML()}
       </div>
       <div id="page-settings" class="page">
-          <div class="page-header"><h2>系统设置</h2></div>
+          <div class="admin-header"><h2>系统设置</h2><button id="theme-toggle" title="切换主题"></button></div>
           <form id="settingsForm">
               <fieldset>
-                  <legend><i class="fa-solid fa-palette"></i> 外观</legend>
-                  <label for="appThemeSelector">主题选择</label>
-                  <select id="appThemeSelector" name="APP_THEME">
-                      <option value="default">默认 (Pico)</option>
-                      <option value="aurora-dark">极光暗色 (Aurora Dark)</option>
-                      <option value="serene-light">静谧浅色 (Serene Light)</option>
-                  </select>
-              </fieldset>
-              <fieldset><legend><i class="fa-brands fa-cloudflare"></i> Cloudflare API 设置</legend><label for="cfToken">API 令牌 (Token)</label><input type="password" id="cfToken" value="${settings.CF_API_TOKEN||''}"><label for="cfZoneId">区域 (Zone) ID</label><input type="text" id="cfZoneId" value="${settings.CF_ZONE_ID||''}">
+                <legend>
+                    <svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 16.5a5 5 0 0 1-5-5 5 5 0 0 1 5-5h7a5 5 0 0 1 5 5 5 5 0 0 1-5 5h-7z"/><path d="M8 12h8"/></svg>
+                    Cloudflare API 设置
+                </legend>
+                <label for="cfToken">API 令牌 (Token)</label><input type="password" id="cfToken" value="${settings.CF_API_TOKEN||''}"><label for="cfZoneId">区域 (Zone) ID</label><input type="text" id="cfZoneId" value="${settings.CF_ZONE_ID||''}">
                   <details class="tutorial-details"><summary>如何获取 API 令牌和区域 ID？</summary><div class="tutorial-content"><ol><li><strong>获取 API 令牌 (Token):</strong><ol type="a"><li>登录 <a href="https://dash.cloudflare.com/" target="_blank">Cloudflare</a>，进入 <strong>“我的个人资料”</strong> &rarr; <strong>“API 令牌”</strong>。</li><li>点击 <strong>“创建令牌”</strong>，然后选择 <strong>“编辑区域 DNS”</strong> 模板并点击“使用模板”。</li><li>在 <strong>“区域资源”</strong> 部分，选择您需要操作的具体域名区域。</li><li>点击“继续以显示摘要”和“创建令牌”，复制生成的令牌。<strong>注意：令牌仅显示一次，请妥善保管。</strong></li></ol></li><li><strong>获取区域 ID (Zone ID):</strong><ol type="a"><li>在 Cloudflare 仪表板主页，点击您需要操作的域名。</li><li>在域名的“概述”页面，您可以在右下角找到 <strong>“区域 ID”</strong>，点击即可复制。</li></ol></li></ol></div></details>
               </fieldset>
-              <fieldset><legend><i class="fa-solid fa-network-wired"></i> 三网优选IP源设置</legend><label for="threeNetworkSource">三网采集源</label><select id="threeNetworkSource"><option value="CloudFlareYes" ${settings.THREE_NETWORK_SOURCE === 'CloudFlareYes' ? 'selected' : ''}>CloudFlareYes</option><option value="api.uouin.com" ${settings.THREE_NETWORK_SOURCE === 'api.uouin.com' ? 'selected' : ''}>api.uouin.com</option><option value="wetest.vip" ${settings.THREE_NETWORK_SOURCE === 'wetest.vip' ? 'selected' : ''}>wetest.vip</option></select><small>为系统预设的电信/移动/联通域名选择IP来源。更改后保存设置将自动同步一次系统域名。</small>
+              <fieldset>
+                <legend>
+                    <svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                    三网优选IP源设置
+                </legend>
+                <label for="threeNetworkSource">三网采集源</label><select id="threeNetworkSource"><option value="CloudFlareYes" ${settings.THREE_NETWORK_SOURCE === 'CloudFlareYes' ? 'selected' : ''}>CloudFlareYes</option><option value="api.uouin.com" ${settings.THREE_NETWORK_SOURCE === 'api.uouin.com' ? 'selected' : ''}>api.uouin.com</option><option value="wetest.vip" ${settings.THREE_NETWORK_SOURCE === 'wetest.vip' ? 'selected' : ''}>wetest.vip</option></select><small>为系统预设的电信/移动/联通域名选择IP来源。更改后保存设置将自动同步一次系统域名。</small>
               </fieldset>
-              <fieldset><legend><i class="fa-brands fa-github"></i> GitHub API 设置</legend><label for="githubToken">GitHub Token</label><input type="password" id="githubToken" value="${settings.GITHUB_TOKEN||''}" placeholder="具有 repo 权限的 Personal Access Token"><label for="githubOwner">GitHub 用户名/组织名</label><input type="text" id="githubOwner" value="${settings.GITHUB_OWNER||''}" placeholder="例如: my-username"><label for="githubRepo">仓库名称</label><input type="text" id="githubRepo" value="${settings.GITHUB_REPO||''}" placeholder="例如: my-dns-records">
+              <fieldset>
+                <legend>
+                    <svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg>
+                    GitHub API 设置
+                </legend>
+                <label for="githubToken">GitHub Token</label><input type="password" id="githubToken" value="${settings.GITHUB_TOKEN||''}" placeholder="具有 repo 权限的 Personal Access Token"><label for="githubOwner">GitHub 用户名/组织名</label><input type="text" id="githubOwner" value="${settings.GITHUB_OWNER||''}" placeholder="例如: my-username"><label for="githubRepo">仓库名称</label><input type="text" id="githubRepo" value="${settings.GITHUB_REPO||''}" placeholder="例如: my-dns-records">
                   <details class="tutorial-details"><summary>如何获取 GitHub API 信息？</summary><div class="tutorial-content"><ol><li><strong>获取 GitHub Token:</strong><ol type="a"><li>登录 <a href="https://github.com/" target="_blank">GitHub</a>，点击右上角头像，进入 <strong>“Settings”</strong>。</li><li>在左侧菜单中，选择 <strong>“Developer settings”</strong> &rarr; <strong>“Personal access tokens”</strong> &rarr; <strong>“Tokens (classic)”</strong>。</li><li>点击 <strong>“Generate new token”</strong>，并选择 <strong>“Generate new token (classic)”</strong>。</li><li>为令牌添加描述（Note），设置合适的过期时间（Expiration）。</li><li>在 <strong>“Select scopes”</strong> 部分，勾选 <code>repo</code> 权限。</li><li>点击页面底部的 <strong>“Generate token”</strong>，并复制生成的令牌。<strong>注意：令牌仅显示一次，请妥善保管。</strong></li></ol></li><li><strong>获取用户名/组织名 和 仓库名称:</strong><ol type="a"><li><strong>用户名/组织名</strong> 就是您的GitHub个人主页URL中，github.com后面的那部分，或者您组织的主页URL。</li><li><strong>仓库名称</strong> 是您在GitHub上创建的，用来存储IP文件的仓库的名字。如果仓库不存在，系统将在第一次同步时自动为您创建为私有仓库。</li></ol></li></ol></div></details>
               </fieldset>
               <button type="submit">保存设置</button>
           </form>
       </div>
   </div>
-  <dialog id="domainModal"><article><header><a href="#close" aria-label="Close" class="close" onclick="window.closeModal('domainModal')"></a><h3 id="modalTitle"></h3></header><form id="domainForm"><input type="hidden" id="domainId"><label for="source_domain">克隆域名</label><input type="text" id="source_domain" placeholder="example-source.com" required><label for="target_domain_prefix">我的域名前缀</label><div class="grid"><input type="text" id="target_domain_prefix" placeholder="subdomain or @" required><span id="zoneNameSuffix" style="line-height:var(--pico-form-element-height);font-weight:700">.your-zone.com</span></div><div class="grid"><div><label for="is_deep_resolve">深度 <span class="tooltip">(?)<span class="tooltip-text">开启后，如果克隆域名是CNAME，系统将递归查找最终的IP地址进行解析。关闭则直接克隆CNAME记录本身。</span></span></label><input type="checkbox" id="is_deep_resolve" role="switch" checked></div><div><label for="ttl">TTL (秒)</label><input type="number" id="ttl" min="60" max="86400" value="60" required></div></div><div class="grid"><div><label for="resolve_record_limit">记录上限</label><input type="number" id="resolve_record_limit" min="1" max="100" value="10" required></div></div><label for="notes">备注 (可选)</label><textarea id="notes" rows="2" placeholder="例如：主力CDN"></textarea><div class="grid"><div><label for="is_single_resolve">单个解析<span class="tooltip">(?)<span class="tooltip-text">开启后，将为每个解析出的IP（根据数量上限）创建单独的子域名。例如 bp1 -> bp1.1, bp1.2 ...</span></span></label><input type="checkbox" id="is_single_resolve" role="switch"></div><div id="single_resolve_limit_container" style="display: none;"><label for="single_resolve_limit">数量上限</label><input type="number" id="single_resolve_limit" min="1" max="50" value="5" required></div></div><div id="single_node_names_container" style="display:none; margin-top: 1rem;"><label><strong>节点名称 (可选)</strong></label></div><footer><button type="button" class="secondary" onclick="window.closeModal('domainModal')">取消</button><button type="submit" id="saveBtn">保存</button></footer></form></article></dialog>
-  <dialog id="ipSourceModal"><article><header><a href="#close" aria-label="Close" class="close" onclick="window.closeModal('ipSourceModal')"></a><h3 id="ipSourceModalTitle"></h3></header><form id="ipSourceForm"><input type="hidden" id="ipSourceId"><div class="grid"><label for="ip_source_url">IP源地址</label><button type="button" class="outline" id="probeBtn" style="width:auto;padding:0 1rem;">探测方案</button></div><input type="text" id="ip_source_url" placeholder="https://example.com/ip_list.txt" required><progress id="probeProgress" style="display:none;"></progress><p id="probeResult" style="font-size:0.9em;"></p><label for="github_path">GitHub 文件路径</label><input type="text" id="github_path" placeholder="IP/Cloudflare.txt" required><label for="commit_message">Commit 信息</label><input type="text" id="commit_message" placeholder="Update Cloudflare IPs" required><label for="is_node_generation_enabled"><input type="checkbox" id="is_node_generation_enabled" name="is_node_generation_enabled" role="switch">生成节点</label><div id="node_names_container" style="display: none; margin-top: 1rem;"><label for="node_names">节点名称 (每行一个)</label><textarea id="node_names" name="node_names" rows="5" placeholder="节点名称1\n节点名称2\n..."></textarea></div><footer><button type="button" class="secondary" onclick="window.closeModal('ipSourceModal')">取消</button><button type="submit" id="saveIpSourceBtn">保存</button></footer></form></article></dialog>
+  <dialog id="domainModal"><article>
+      <header>
+          <h3 id="modalTitle"></h3>
+          <a href="#close" aria-label="Close" class="close" onclick="window.closeModal('domainModal')">&times;</a>
+      </header>
+      <form id="domainForm"><input type="hidden" id="domainId"><label for="source_domain">克隆域名</label><input type="text" id="source_domain" placeholder="example-source.com" required><label for="target_domain_prefix">我的域名前缀</label><div class="grid"><input type="text" id="target_domain_prefix" placeholder="subdomain or @" required><span id="zoneNameSuffix" style="line-height:var(--pico-form-element-height);font-weight:700">.your-zone.com</span></div><div class="grid"><div><label for="is_deep_resolve">深度 <span class="tooltip">(?)<span class="tooltip-text">开启后，如果克隆域名是CNAME，系统将递归查找最终的IP地址进行解析。关闭则直接克隆CNAME记录本身。</span></span></label><input type="checkbox" id="is_deep_resolve" role="switch" checked></div><div><label for="ttl">TTL (秒)</label><input type="number" id="ttl" min="60" max="86400" value="60" required></div></div><div class="grid"><div><label for="resolve_record_limit">记录上限</label><input type="number" id="resolve_record_limit" min="1" max="100" value="10" required></div></div><label for="notes">备注 (可选)</label><textarea id="notes" rows="2" placeholder="例如：主力CDN"></textarea><div class="grid"><div><label for="is_single_resolve">单个解析<span class="tooltip">(?)<span class="tooltip-text">开启后，将为每个解析出的IP（根据数量上限）创建单独的子域名。例如 bp1 -> bp1.1, bp1.2 ...</span></span></label><input type="checkbox" id="is_single_resolve" role="switch"></div><div id="single_resolve_limit_container" style="display: none;"><label for="single_resolve_limit">数量上限</label><input type="number" id="single_resolve_limit" min="1" max="50" value="5" required></div></div><div id="single_node_names_container" style="display:none; margin-top: 1rem;"><label><strong>节点名称 (可选)</strong></label></div><footer><button type="button" class="secondary" onclick="window.closeModal('domainModal')">取消</button><button type="submit" id="saveBtn">保存</button></footer></form></article></dialog>
+  <dialog id="ipSourceModal"><article>
+    <header>
+        <h3 id="ipSourceModalTitle"></h3>
+        <a href="#close" aria-label="Close" class="close" onclick="window.closeModal('ipSourceModal')">&times;</a>
+    </header>
+    <form id="ipSourceForm"><input type="hidden" id="ipSourceId"><div class="grid"><label for="ip_source_url">IP源地址</label><button type="button" class="outline" id="probeBtn" style="width:auto;padding:0 1rem;">探测方案</button></div><input type="text" id="ip_source_url" placeholder="https://example.com/ip_list.txt" required><progress id="probeProgress" style="display:none;"></progress><p id="probeResult" style="font-size:0.9em;"></p><label for="github_path">GitHub 文件路径</label><input type="text" id="github_path" placeholder="IP/Cloudflare.txt" required><label for="commit_message">Commit 信息</label><input type="text" id="commit_message" placeholder="Update Cloudflare IPs" required><label for="is_node_generation_enabled"><input type="checkbox" id="is_node_generation_enabled" name="is_node_generation_enabled" role="switch">生成节点</label><div id="node_names_container" style="display: none; margin-top: 1rem;"><label for="node_names">节点名称 (每行一个)</label><textarea id="node_names" name="node_names" rows="5" placeholder="节点名称1\n节点名称2\n..."></textarea></div><footer><button type="button" class="secondary" onclick="window.closeModal('ipSourceModal')">取消</button><button type="submit" id="saveIpSourceBtn">保存</button></footer></form></article></dialog>
   <dialog id="snippetsModal"><article>
-      <header><a href="#close" aria-label="Close" class="close" onclick="window.closeModal('snippetsModal')"></a><h3>如何部署 Snippets 反${_k(['代','理'])}？</h3></header>
+      <header>
+        <h3>如何部署 Snippets 反${_k(['代','理'])}？</h3>
+        <a href="#close" aria-label="Close" class="close" onclick="window.closeModal('snippetsModal')">&times;</a>
+      </header>
       <p>Snippets 是 Cloudflare 提供的一项功能，可以在边缘节点执行轻量级代码，非常适合用于反向${_k(['代','理'])}。</p>
       <ol>
           <li><strong>检查权限</strong>：登录您的 Cloudflare 账户，选择一个已绑定的域名。在左侧菜单中点击 <strong>规则 → Snippets</strong>。如果您能看到创建和管理界面，说明您拥有使用权限。</li>
@@ -1792,9 +1842,9 @@ function renderDomainCard(domain) {
   return \`
   <div class="domain-card \${systemClass}" id="domain-card-\${domain.id}">
       <div class="card-col"><strong>我的域名 → 克隆源</strong><span class="domain-cell" title="\${domain.target_domain}" onclick="window.copyToClipboard('\${domain.target_domain}')">\${displayContent}</span><small class="domain-cell" title="\${domain.source_domain}">\${sourceDisplay}</small></div>
-      <div class="card-col"><strong>当前解析 <i class="fa-solid fa-arrows-rotate refresh-icon" title="实时查询解析" onclick="window.refreshSingleDomainRecords(\${domain.id})"></i></strong><div id="records-container-\${domain.id}">\${renderLiveRecords(displayedRecords)}</div></div>
+      <div class="card-col"><strong>当前解析 <svg class="refresh-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" title="实时查询解析" onclick="window.refreshSingleDomainRecords(\${domain.id})"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg></strong><div id="records-container-\${domain.id}">\${renderLiveRecords(displayedRecords)}</div></div>
       <div class="card-col"><strong>上次同步</strong><div>\${renderStatus(domain)}</div><small>\${formatBeijingTime(domain.last_synced_time)}</small></div>
-      <div class="card-actions"><button class="outline" onclick="window.individualSync(\${domain.id})">同步</button><button class="secondary outline" onclick="window.openModal('domainModal', \${domain.id})">编辑</button><button class="contrast outline" onclick="window.deleteDomain(\${domain.id})" \${isSystem ? 'disabled' : ''}>删除</button></div>
+      <div class="card-actions"><button class="outline" onclick="window.individualSync(\${domain.id})">同步</button><button class="secondary" onclick="window.openModal('domainModal', \${domain.id})">编辑</button><button class="contrast" onclick="window.deleteDomain(\${domain.id})" \${isSystem ? 'disabled' : ''}>删除</button></div>
   </div>\`;
 }
 function renderDomainList() { 
@@ -1802,7 +1852,7 @@ function renderDomainList() {
   if (currentDomains.length > 0) {
       container.innerHTML = currentDomains.map(renderDomainCard).join(''); 
   } else {
-      container.innerHTML = '<div class="empty-state"><p>暂无域名克隆目标，请点击右上角按钮添加。</p></div>';
+      container.innerHTML = '<article><p>暂无域名克隆目标，请点击右上角按钮添加。</p></article>';
   }
 }
 
@@ -1813,7 +1863,7 @@ function renderIpSourceCard(source) {
       <div class="card-col" style="flex-grow: 2;"><strong>GitHub 文件路径</strong><a href="\${fileUrl}" target="_blank" class="domain-cell" onclick="event.stopPropagation();">\${source.github_path}</a><small class="domain-cell" title="\${source.url}">源: \${source.url}</small></div>
       <div class="card-col"><strong>抓取策略</strong><span>\${source.fetch_strategy || '尚未探测'}</span></div>
       <div class="card-col"><strong>上次同步</strong><small>\${renderStatus(source)} @ \${formatBeijingTime(source.last_synced_time)}</small></div>
-      <div class="card-actions"><button class="outline" onclick="window.syncSingleIpSource(\${source.id})">同步</button><button class="secondary outline" onclick="window.openModal('ipSourceModal', \${source.id})">编辑</button><button class="contrast outline" onclick="window.deleteIpSource(\${source.id})">删除</button></div>
+      <div class="card-actions"><button class="outline" onclick="window.syncSingleIpSource(\${source.id})">同步</button><button class="secondary" onclick="window.openModal('ipSourceModal', \${source.id})">编辑</button><button class="contrast" onclick="window.deleteIpSource(\${source.id})">删除</button></div>
   </div>\`;
 }
 function renderIpSourceList() { 
@@ -1821,7 +1871,7 @@ function renderIpSourceList() {
   if (currentIpSources.length > 0) {
       container.innerHTML = currentIpSources.map(renderIpSourceCard).join('');
   } else {
-      container.innerHTML = '<div class="empty-state"><p>暂无IP源，请点击右上角按钮添加。</p></div>';
+      container.innerHTML = '<article><p>暂无IP源，请点击右上角按钮添加。</p></article>';
   }
 }
 
@@ -1987,7 +2037,7 @@ async function refreshDomains() {
 window.refreshSingleDomainRecords = async (id) => {
     const container = document.getElementById(\`records-container-\${id}\`);
     if (!container) return;
-    container.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 正在查询...';
+    container.innerHTML = '查询中...';
     try {
         const records = await apiFetch('/api/domains/' + id + '/resolve', { method: 'POST' });
         container.innerHTML = renderLiveRecords(records);
@@ -2015,7 +2065,7 @@ async function saveIpSource() {
   async function refreshIpSources() { try { currentIpSources = await apiFetch('/api/ip_sources'); renderIpSourceList(); } catch (e) { showNotification(\`更新IP源列表失败: <code>\${e.message}</code>\`, 'error'); } }
 
 async function handleStreamingRequest(url, btn, logOutputElem) {
-  const allButtons = document.querySelectorAll('button'); allButtons.forEach(b => b.disabled = true); const originalBtnText = btn ? btn.textContent : ''; if (btn) { btn.innerHTML = \`<i class="fa-solid fa-spinner fa-spin"></i> 同步中\`; btn.setAttribute('aria-busy', 'true'); }
+  const allButtons = document.querySelectorAll('button'); allButtons.forEach(b => b.disabled = true); const originalBtnText = btn ? btn.textContent : ''; if (btn) { btn.innerHTML = '同步中...'; btn.setAttribute('aria-busy', 'true'); }
   logOutputElem.style.display = 'block';
   logOutputElem.textContent = '开始同步任务...\\n';
   try { 
@@ -2037,7 +2087,7 @@ async function handleStreamingRequest(url, btn, logOutputElem) {
       logOutputElem.textContent += '\\n发生严重错误：\\n' + e.message; 
       showNotification('同步任务发生错误', 'error');
   } finally { 
-      allButtons.forEach(b => { if (!b.closest('dialog')) b.disabled = false; });
+      allButtons.forEach(b => b.disabled = false);
       if (btn) { btn.innerHTML = originalBtnText; btn.removeAttribute('aria-busy'); } 
   }
 }
@@ -2132,7 +2182,7 @@ window.syncSingleIpSource = (id) => {
               }
 
               e.target.disabled = true;
-              e.target.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
+              e.target.innerHTML = '检测中...';
               resultEl.textContent = '';
 
               try {
@@ -2142,15 +2192,15 @@ window.syncSingleIpSource = (id) => {
                   });
                   if (result.success) {
                       resultEl.textContent = \`✔ 成功 (\${result.nodeCount}个节点)\`;
-                      resultEl.style.color = 'var(--pico-color-green-500)';
+                      resultEl.style.color = 'var(--status-success-color)';
                   } else {
                       resultEl.textContent = \`✖ 失败\`;
-                      resultEl.style.color = 'var(--pico-color-red-500)';
+                      resultEl.style.color = 'var(--status-failed-color)';
                       showNotification(result.error, 'error');
                   }
               } catch (err) {
                   resultEl.textContent = \`✖ 失败\`;
-                  resultEl.style.color = 'var(--pico-color-red-500)';
+                  resultEl.style.color = 'var(--status-failed-color)';
                   showNotification(err.message, 'error');
               } finally {
                   e.target.disabled = false;
@@ -2177,37 +2227,24 @@ window.syncSingleIpSource = (id) => {
       
       document.getElementById('global-filters-container').style.display = filterMode === 'global' ? 'block' : 'none';
 
-      container.innerHTML = '';
-      if (subs.length >= 0) {
-          subs.forEach((sub, index) => {
-              const subEl = document.createElement('div');
-              subEl.className = 'sub-item-row';
-              subEl.style.marginBottom = '1.5rem';
-              subEl.innerHTML = \`
-                  <div class="grid">
-                      <div style="grid-column: span 12;">
-                      <input type="text" class="ext-sub-url" placeholder="${_k(['订','阅'])}地址" value="\${sub.url || ''}">
-                      </div>
+      container.innerHTML = (subs || []).map((sub, index) => {
+          return \`
+              <div class="sub-item-row">
+                  <input type="text" class="ext-sub-url" placeholder="${_k(['订','阅'])}地址" value="\${sub.url || ''}">
+                  <div class="ext-sub-filters-container" \${filterMode !== 'individual' ? 'style="display:none;"' : ''}>
+                      <textarea class="ext-sub-filters" rows="2" placeholder="过滤规则 (每行一条，例如 #M:名称=新名称)">\${sub.filters || ''}</textarea>
                   </div>
-                  <div class="grid" \${filterMode !== 'individual' ? 'style="display:none;"' : ''}>
-                      <div style="grid-column: span 12;">
-                          <textarea class="ext-sub-filters" rows="2" placeholder="过滤规则 (每行一条，例如 #M:名称=新名称)">\${sub.filters || ''}</textarea>
-                      </div>
+                  <div class="sub-item-controls">
+                      <label class="form-control-inline">
+                          <input type="checkbox" class="ext-sub-enabled" \${sub.enabled ? 'checked' : ''}> <span>启用</span>
+                      </label>
+                      <small class="ext-sub-result" id="ext-sub-result-\${index}"></small>
+                      <button class="secondary test-sub-btn" data-index="\${index}">检测</button>
+                      <button class="contrast delete-sub-btn" data-index="\${index}">删除</button>
                   </div>
-                  <div class="grid">
-                      <div style="grid-column: span 12; display:flex; align-items:center; justify-content:flex-start; gap: 1rem;">
-                          <label style="white-space: nowrap;">
-                              <input type="checkbox" class="ext-sub-enabled" \${sub.enabled ? 'checked' : ''}> 启用
-                          </label>
-                          <small class="ext-sub-result" id="ext-sub-result-\${index}"></small>
-                          <button class="secondary outline test-sub-btn" data-index="\${index}" style="margin-left:auto;">检测</button>
-                          <button class="secondary outline delete-sub-btn" data-index="\${index}">删除</button>
-                      </div>
-                  </div>
-              \`;
-              container.appendChild(subEl);
-          });
-      }
+              </div>
+          \`;
+      }).join('');
   }
   
   function populateProxySettingsForm() {
@@ -2228,7 +2265,6 @@ window.syncSingleIpSource = (id) => {
       document.getElementById('customNodes').value = ps.customNodes || '';
       document.getElementById(\`filterMode\${ps.filterMode ? ps.filterMode.charAt(0).toUpperCase() + ps.filterMode.slice(1) : 'None'}\`).checked = true;
       document.getElementById('globalFilters').value = ps.globalFilters || '';
-      document.getElementById('appThemeSelector').value = ps.APP_THEME || 'default';
       
       renderExternalSubscriptions(ps.externalSubscriptions);
   }
@@ -2261,8 +2297,7 @@ window.syncSingleIpSource = (id) => {
               externalSubscriptions: externalSubscriptions,
               customNodes: document.getElementById('customNodes').value,
               filterMode: document.querySelector('input[name="filterMode"]:checked').value,
-              globalFilters: document.getElementById('globalFilters').value,
-              APP_THEME: document.getElementById('appThemeSelector').value
+              globalFilters: document.getElementById('globalFilters').value
           };
           
           const oldProxySettings = currentSettings.proxySettings;
@@ -2335,8 +2370,14 @@ window.syncSingleIpSource = (id) => {
 
 async function saveSettings(event) {
   event.preventDefault();
-  const btn = event.target.querySelector('button');
-  btn.disabled = true; btn.setAttribute('aria-busy', 'true');
+  const form = event.target;
+  const btn = form.querySelector('button[type="submit"]');
+  if (!btn) return;
+
+  const originalBtnText = btn.textContent;
+  btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
+  btn.textContent = '正在保存...';
   
   const oldThreeNetworkSource = currentSettings.THREE_NETWORK_SOURCE;
   const newThreeNetworkSource = document.getElementById('threeNetworkSource').value;
@@ -2353,6 +2394,7 @@ async function saveSettings(event) {
   try {
       const result = await apiFetch('/api/settings', { method: 'POST', body: JSON.stringify(settingsToSave) });
       showNotification(result.message || '设置已保存！', 'success');
+      btn.textContent = '保存成功!';
       
       if (oldThreeNetworkSource !== newThreeNetworkSource) {
           showNotification('三网优选源已更改，正在为您同步系统域名...', 'info');
@@ -2368,20 +2410,46 @@ async function saveSettings(event) {
       await refreshDomains();
   } catch (e) {
       showNotification(\`保存失败: <br><code>\${e.message}</code>\`, 'error', 10000);
+      btn.textContent = '保存失败';
   } finally {
-      btn.disabled = false; btn.removeAttribute('aria-busy');
+      setTimeout(() => {
+          btn.disabled = false;
+          btn.removeAttribute('aria-busy');
+          btn.textContent = originalBtnText;
+      }, 2000);
   }
 }
 
-function applyTheme(theme) {
-      document.documentElement.className = theme || 'default';
-}
-
 document.addEventListener('DOMContentLoaded', async () => {
+    let isDark = false;
+    const themeToggle = document.getElementById('theme-toggle');
+    const moonIcon = \`<svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>\`;
+    const sunIcon = \`<svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>\`;
+
+    function updateTheme() {
+        if(themeToggle) themeToggle.innerHTML = isDark ? sunIcon : moonIcon;
+        document.documentElement.classList.toggle('dark', isDark);
+    }
+    
+    if (themeToggle) {
+        themeToggle.addEventListener('click', () => {
+            isDark = !isDark;
+            updateTheme();
+        });
+    }
+
+    function setInitialMode() {
+        const now = new Date();
+        const utcHour = now.getUTCHours();
+        const beijingHour = (utcHour + 8) % 24;
+        isDark = !(beijingHour >= 7 && beijingHour < 19);
+        updateTheme();
+    }
+    setInitialMode();
+
   try {
       currentSettings = await apiFetch('/api/settings');
       zoneName = currentSettings.zoneName || '';
-      applyTheme(currentSettings.proxySettings.APP_THEME);
   } catch(e) {
       showNotification('加载设置失败', 'error');
   }
@@ -2400,6 +2468,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           document.getElementById(targetId).classList.add('active');
           navLinks.forEach(l => l.classList.remove('active'));
           link.classList.add('active');
+          window.scrollTo(0, 0);
       });
   });
   
@@ -2423,11 +2492,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           const currentNames = Array.from(document.querySelectorAll('.single-node-name-input')).map(input => input.value);
           updateSingleNodeNameInputs(parseInt(limitInput.value, 10) || 0, currentNames);
       }
-  });
-
-  document.getElementById('appThemeSelector').addEventListener('change', (e) => {
-          applyTheme(e.target.value);
-          saveProxySettings();
   });
 
   document.getElementById('addIpSourceBtn').addEventListener('click', () => openModal('ipSourceModal'));
@@ -3245,7 +3309,7 @@ function parseFilterRules(filters) {
   if (!filters) return [];
   return filters.split('\n').filter(Boolean).map(line => {
       line = line.trim();
-      if (line.startsWith('#M:') || line.startsWith('#H:')) {
+if (line.startsWith('#M:') || line.startsWith('#H:')) {
           const type = line.substring(0, 3);
           const ruleContent = line.substring(3);
           const parts = ruleContent.split('=');
