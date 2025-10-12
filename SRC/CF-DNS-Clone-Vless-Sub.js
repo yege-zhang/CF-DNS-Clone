@@ -17,6 +17,12 @@ const _du = (encodedStr) => {
     }
 };
 
+async function generateHash(content) {
+    const data = new TextEncoder().encode(content);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 export default {
   async fetch(request, env, ctx) {
       const upgradeHeader = request.headers.get("Upgrade");
@@ -76,32 +82,48 @@ export default {
   async scheduled(controller, env, ctx) {
       console.log("Scheduled task started: Initializing...");
       await initializeAndMigrateDatabase(env);
-
+      const log = (msg) => console.log(beijingTimeLog(msg));
       const db = env.WUYA;
-      const nextTask = await getSetting(db, 'next_sync_task') || 'domains';
+      const minute = new Date().getUTCMinutes();
 
-      switch (nextTask) {
-          case 'domains':
-          console.log("Scheduled task: Syncing a batch of DNS records (failure-first)...");
-          await syncScheduledDomains(env);
-          await setSetting(db, 'next_sync_task', 'ip_sources');
-          break;
-          case 'ip_sources':
-          console.log("Scheduled task: Syncing a batch of IP sources to GitHub (failure-first)...");
-          await syncScheduledIpSources(env);
-          await setSetting(db, 'next_sync_task', 'external_subs');
-          break;
-          case 'external_subs':
-          console.log("Scheduled task: Syncing an external subscription...");
-          await syncScheduledExternalSubs(env);
-          await setSetting(db, 'next_sync_task', 'domains');
-          break;
-          default:
-          await setSetting(db, 'next_sync_task', 'domains');
-          break;
+      try {
+          if (minute % 20 === 0) {
+              log("Task Dispatcher: Marking IP sources for sync.");
+              await db.prepare("UPDATE ip_sources SET needs_sync = 1 WHERE is_enabled = 1").run();
+          }
+
+          if (minute % 5 === 0) {
+              log("Task Dispatcher: Marking domains for sync.");
+              await db.prepare("UPDATE domains SET needs_sync = 1 WHERE is_enabled = 1").run();
+          }
+
+          const ipSourceToSync = await db.prepare("SELECT id FROM ip_sources WHERE needs_sync = 1 LIMIT 1").first();
+          if (ipSourceToSync) {
+              log(`Task Consumer: Processing IP source ID ${ipSourceToSync.id}`);
+              await syncSingleIpSourceToD1(ipSourceToSync.id, env, log);
+              await db.prepare("UPDATE ip_sources SET needs_sync = 0 WHERE id = ?").bind(ipSourceToSync.id).run();
+          } else {
+              log("Task Consumer: No IP sources in queue.");
+          }
+
+          const domainToSync = await db.prepare("SELECT * FROM domains WHERE needs_sync = 1 LIMIT 1").first();
+          if (domainToSync) {
+              if (domainToSync.is_system) {
+                  log("Task Consumer: Processing system domains as a unit.");
+                  await syncSystemDomainsAsUnit(env, log);
+              } else {
+                  log(`Task Consumer: Processing domain ID ${domainToSync.id}`);
+                  await syncSingleDomain(domainToSync.id, env, false);
+                  await db.prepare("UPDATE domains SET needs_sync = 0 WHERE id = ?").bind(domainToSync.id).run();
+              }
+          } else {
+              log("Task Consumer: No domains in queue.");
+          }
+
+      } catch (e) {
+          log(`Scheduled task error: ${e.message}`);
       }
-
-      console.log("Scheduled task for this cycle finished.");
+      log("Scheduled task for this cycle finished.");
   },
 };
 
@@ -315,103 +337,6 @@ function generateInternalNodes(domains, proxySettings, request) {
   });
 }
 
-
-async function syncScheduledDomains(env) {
-  const BATCH_SIZE = 5;
-  const db = env.WUYA;
-  const log = (msg) => console.log(beijingTimeLog(msg));
-
-  const { token, zoneId } = await getCfApiSettings(db);
-  if (!token || !zoneId) {
-      log("Cannot run scheduled domain sync: Cloudflare settings are missing.");
-      return;
-  }
-
-  const query = `
-      SELECT * FROM domains 
-      WHERE is_enabled = 1 
-      ORDER BY 
-          CASE last_sync_status WHEN 'failed' THEN 0 ELSE 1 END, 
-          last_synced_time ASC
-      LIMIT ?`;
-  
-  const { results: domainsToSync } = await db.prepare(query).bind(BATCH_SIZE).all();
-
-  if (domainsToSync.length === 0) {
-      log("No domains to sync in this batch.");
-      return;
-  }
-
-  log(`Found ${domainsToSync.length} domains for this sync batch (failure-first).`);
-  
-  const allZoneRecords = await listAllDnsRecords(token, zoneId);
-  const syncContext = { allZoneRecords };
-
-  for (const domain of domainsToSync) {
-      try {
-          await syncDomainLogic(domain, token, zoneId, db, log, syncContext);
-      } catch (e) {
-          log(`Error processing domain ${domain.target_domain} in batch: ${e.message}`);
-      }
-  }
-}
-
-async function syncScheduledIpSources(env) {
-  const BATCH_SIZE = 5;
-  const db = env.WUYA;
-  const log = (msg) => console.log(beijingTimeLog(msg));
-
-  const githubSettings = await getGitHubSettings(db);
-  if (!githubSettings.token || !githubSettings.owner || !githubSettings.repo) {
-      log("Cannot run scheduled IP source sync: GitHub settings are missing.");
-      return;
-  }
-
-  const query = `
-      SELECT id FROM ip_sources 
-      WHERE is_enabled = 1 
-      ORDER BY 
-          CASE last_sync_status WHEN 'failed' THEN 0 ELSE 1 END, 
-          last_synced_time ASC
-      LIMIT ?`;
-
-  const { results: sourcesToSync } = await db.prepare(query).bind(BATCH_SIZE).all();
-
-  if (sourcesToSync.length === 0) {
-      log("No IP sources to sync in this batch.");
-      return;
-  }
-
-  log(`Found ${sourcesToSync.length} IP sources for this sync batch (failure-first).`);
-  for (const source of sourcesToSync) {
-      await syncSingleIpSource(source.id, env, false).catch(e => {
-          log(`Error processing IP source ID ${source.id} in batch: ${e.message}`);
-      });
-  }
-}
-
-async function syncScheduledExternalSubs(env) {
-  const db = env.WUYA;
-  const log = (msg) => console.log(beijingTimeLog(msg));
-  const proxySettings = await getProxySettings(db);
-
-  const subsToSync = proxySettings.externalSubscriptions?.filter(sub => sub.enabled && sub.url) || [];
-  if (subsToSync.length === 0) {
-      log("No enabled external subscriptions to sync.");
-      return;
-  }
-  
-  const lastSyncedIndex = parseInt(await getSetting(db, 'last_ext_sub_synced_index') || '-1', 10);
-  const nextIndex = (lastSyncedIndex + 1) % subsToSync.length;
-  const subToSync = subsToSync[nextIndex];
-  
-  log(`Syncing external subscription: ${subToSync.url}`);
-  await syncExternalSubscription(subToSync, db, log);
-  
-  await setSetting(db, 'last_ext_sub_synced_index', nextIndex.toString());
-}
-
-
 async function initializeAndMigrateDatabase(env) {
 if (!env.WUYA) {
   throw new Error("D1 database binding 'WUYA' not found. Please configure it in your Worker settings.");
@@ -438,6 +363,7 @@ const expectedSchemas = {
       'last_sync_error TEXT',
       'is_enabled INTEGER DEFAULT 1 NOT NULL',
       'is_system INTEGER NOT NULL DEFAULT 0',
+      'needs_sync INTEGER NOT NULL DEFAULT 0',
       'UNIQUE(target_domain)'
   ],
   sessions: ['token TEXT PRIMARY KEY NOT NULL', 'expires_at TIMESTAMP NOT NULL'],
@@ -452,7 +378,16 @@ const expectedSchemas = {
       'last_sync_error TEXT',
       'is_enabled INTEGER DEFAULT 1 NOT NULL',
       'is_node_generation_enabled INTEGER NOT NULL DEFAULT 0',
-      'node_names TEXT'
+      'node_names TEXT',
+      'consecutive_failures INTEGER NOT NULL DEFAULT 0',
+      'cached_content TEXT',
+      'content_hash TEXT',
+      'last_pushed_hash TEXT',
+      'needs_push INTEGER NOT NULL DEFAULT 0',
+      'needs_sync INTEGER NOT NULL DEFAULT 0',
+      'is_delayed INTEGER NOT NULL DEFAULT 0',
+      'delay_min INTEGER NOT NULL DEFAULT 0',
+      'delay_max INTEGER NOT NULL DEFAULT 0'
   ],
   external_nodes: [
       'url TEXT PRIMARY KEY NOT NULL',
@@ -477,6 +412,7 @@ for (const tableName in expectedSchemas) {
       const columnName = columnDef.split(' ')[0];
       if (!existingColumnNames.includes(columnName)) {
           try {
+              console.log(`Adding column ${columnName} to table ${tableName}...`);
               await db.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${columnDef}`).run();
           } catch (e) { console.error(`Failed to add column '${columnName}' to '${tableName}':`, e.message); }
       }
@@ -499,6 +435,19 @@ if (invalidDomains.length > 0) {
       await db.batch(fixStmts);
   } catch (e) { console.error("Failed to fix invalid domain entries:", e.message); }
 }
+
+const migrationKey = 'MIGRATE_SYSTEM_LIMIT_TO_3';
+const migrated = await getSetting(db, migrationKey);
+if (!migrated) {
+    console.log("Running one-time migration to set system domain limits to 3...");
+    try {
+        await db.prepare("UPDATE domains SET resolve_record_limit = 3 WHERE is_system = 1").run();
+        await setSetting(db, migrationKey, 'true');
+        console.log("Migration successful.");
+    } catch (e) {
+        console.error("Migration failed:", e.message);
+    }
+}
 }
 
 async function ensureInitialData(db, zoneId, zoneName) {
@@ -508,35 +457,35 @@ async function ensureInitialData(db, zoneId, zoneName) {
 
   const initialIpSources = [
       { url: _e(_d([104,116,116,112,115,58,47,47,105,112,100,98,46,97,112,105,46,48,51,48,49,48,49,46,120,121,122,47,63,116,121,112,101,61,98,101,115,116,99,102,38,99,111,117,110,116,114,121,61,116,114,117,101])), path: '030101-bestcf.txt', msg: 'Update BestCF IPs from 030101.xyz', strategy: _k(['phantomjs','_cloud']) },
-      { url: _e(_d([104,116,116,112,115,58,47,47,105,112,100,98,46,97,112,105,46,48,51,48,49,48,49,46,120,121,122,47,63,116,121,112,101,61,98,101,115,116,112,114,111,121,38,99,111,117,110,116,114,121,61,116,114,117,101])), path: '030101-bestproxy.txt', msg: 'Update BestProxy IPs from 030101.xyz', strategy: _k(['phantomjs','_cloud']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,105,112,100,98,46,97,112,105,46,48,51,48,49,48,49,46,120,121,122,47,63,116,121,112,101,61,98,101,115,116,112,114,111,120,121,38,99,111,117,110,116,114,121,61,116,114,117,101])), path: '030101-bestproxy.txt', msg: 'Update BestProxy IPs from 030101.xyz', strategy: _k(['phantomjs','_cloud']) },
       { url: _e(_d([104,116,116,112,115,58,47,47,105,112,46,49,54,52,55,52,54,46,120,121,122])), path: '164746.txt', msg: 'Update IPs from 164746.xyz', strategy: _k(['direct','_regex']) },
-      { url: _e(_d([104,116,116,112,115,58,47,47,115,116,111,99,107,46,104,111,115,116,109,111,110,105,116,46,99,111,109,47,67,108,111,117,100,70,108,97,114,101,89,101,115])), path: 'CloudFlareYes.txt', msg: 'Update CloudFlareYes IPs', strategy: _k(['phantomjs','_cloud']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,115,116,111,99,107,46,104,111,115,116,109,111,110,105,116,46,99,111,109,47,67,108,111,117,100,70,108,97,114,101,89,101,115])), path: 'CloudFlareYes.txt', msg: 'Update CloudFlareYes IPs', strategy: _k(['phantomjs_cloud','_interactive']) },
       { url: _e(_d([104,116,116,112,115,58,47,47,105,112,46,104,97,111,103,101,103,101,46,120,121,122])), path: 'haogege.txt', msg: 'Update IPs from haogege.xyz', strategy: _k(['direct','_regex']) },
-      { url: _e(_d([104,116,116,112,115,58,47,47,97,112,105,46,117,111,117,105,110,46,99,111,109,47,99,108,111,117,100,102,108,97,114,101,46,104,116,109,108])), path: 'uouin-cloudflare.txt', msg: 'Update IPs from uouin.com', strategy: _k(['direct','_regex']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,97,112,105,46,117,111,117,105,110,46,99,111,109,47,99,108,111,117,100,102,108,97,114,101,46,104,116,109,108])), path: 'uouin-cloudflare.txt', msg: 'Update IPs from uouin.com', strategy: _k(['phantomjs_cloud','_interactive']) },
       { url: _e(_d([104,116,116,112,115,58,47,47,119,119,119,46,119,101,116,101,115,116,46,118,105,112,47,112,97,103,101,47,99,108,111,117,100,102,108,97,114,101,47,97,100,100,114,101,115,115,95,118,52,46,104,116,109,108])), path: 'wetest-cloudflare-v4.txt', msg: 'Update Cloudflare v4 IPs from wetest.vip', strategy: _k(['direct','_regex']) },
       { url: _e(_d([104,116,116,112,115,58,47,47,119,119,119,46,119,101,116,101,115,116,46,118,105,112,47,112,97,103,101,47,101,100,103,101,111,110,101,47,97,100,100,114,101,115,115,95,118,52,46,104,116,109,108])), path: 'wetest-edgeone-v4.txt', msg: 'Update EdgeOne v4 IPs from wetest.vip', strategy: _k(['direct','_regex']) },
   ];
   const ipSourceStmts = initialIpSources.map(s => 
-      db.prepare('INSERT INTO ip_sources (url, github_path, commit_message, fetch_strategy) VALUES (?, ?, ?, ?) ON CONFLICT(url) DO NOTHING')
+      db.prepare('INSERT INTO ip_sources (url, github_path, commit_message, fetch_strategy) VALUES (?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET fetch_strategy=excluded.fetch_strategy')
       .bind(s.url, s.path, s.msg, s.strategy)
   );
   
   const initialDomains = [
-      { source: 'internal:hostmonit:yd', prefix: 'yd', notes: '移动', is_system: 1, deep_resolve: 1 },
-      { source: 'internal:hostmonit:dx', prefix: 'dx', notes: '电信', is_system: 1, deep_resolve: 1 },
-      { source: 'internal:hostmonit:lt', prefix: 'lt', notes: '联通', is_system: 1, deep_resolve: 1 },
-      { source: 'www.wto.org', prefix: 'wto', notes: 'wto', is_system: 0, deep_resolve: 1 },
-      { source: 'www.visa.com.sg', prefix: 'visasg', notes: 'visasg', is_system: 0, deep_resolve: 1 },
-      { source: 'openai.com', prefix: 'openai', notes: 'openai', is_system: 0, deep_resolve: 1 },
-      { source: 'www.shopify.com', prefix: 'sy', notes: 'shopify', is_system: 0, deep_resolve: 1 },
-      { source: 'snipaste5.speedip.eu.org', prefix: 'bp', notes: 'bp', is_system: 0, deep_resolve: 1 },
-      { source: 'cf.090227.xyz', prefix: 'cm', notes: 'cm', is_system: 0, deep_resolve: 1 },
-      { source: 'cf.877774.xyz', prefix: 'qms', notes: 'qms', is_system: 0, deep_resolve: 1 },
+      { source: 'internal:hostmonit:yd', prefix: 'yd', notes: '移动', is_system: 1, deep_resolve: 1, limit: 3 },
+      { source: 'internal:hostmonit:dx', prefix: 'dx', notes: '电信', is_system: 1, deep_resolve: 1, limit: 3 },
+      { source: 'internal:hostmonit:lt', prefix: 'lt', notes: '联通', is_system: 1, deep_resolve: 1, limit: 3 },
+      { source: 'www.wto.org', prefix: 'wto', notes: 'wto', is_system: 0, deep_resolve: 1, limit: 10 },
+      { source: 'www.visa.com.sg', prefix: 'visasg', notes: 'visasg', is_system: 0, deep_resolve: 1, limit: 10 },
+      { source: 'openai.com', prefix: 'openai', notes: 'openai', is_system: 0, deep_resolve: 1, limit: 10 },
+      { source: 'www.shopify.com', prefix: 'sy', notes: 'shopify', is_system: 0, deep_resolve: 1, limit: 10 },
+      { source: 'snipaste5.speedip.eu.org', prefix: 'bp', notes: 'bp', is_system: 0, deep_resolve: 1, limit: 10 },
+      { source: 'cf.090227.xyz', prefix: 'cm', notes: 'cm', is_system: 0, deep_resolve: 1, limit: 10 },
+      { source: 'cf.877774.xyz', prefix: 'qms', notes: 'qms', is_system: 0, deep_resolve: 1, limit: 10 },
   ];
   const domainStmts = initialDomains.map(d => {
       const targetDomain = d.prefix === '@' ? zoneName : `${d.prefix}.${zoneName}`;
-      return db.prepare('INSERT INTO domains (source_domain, target_domain, zone_id, is_deep_resolve, notes, is_system) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(target_domain) DO NOTHING')
-              .bind(d.source, targetDomain, zoneId, d.deep_resolve, d.notes, d.is_system);
+      return db.prepare('INSERT INTO domains (source_domain, target_domain, zone_id, is_deep_resolve, notes, is_system, resolve_record_limit) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(target_domain) DO NOTHING')
+              .bind(d.source, targetDomain, zoneId, d.deep_resolve, d.notes, d.is_system, d.limit);
   });
 
   await db.batch([...ipSourceStmts, ...domainStmts]);
@@ -588,7 +537,8 @@ async function getProxySettings(db) {
         customNodes: '',
         filterMode: 'none', 
         globalFilters: '',
-        APP_THEME: 'default'
+        APP_THEME: 'default',
+        showSourceOnHomepage: false
     };
 
     return { ...defaultSettings, ...storedSettings };
@@ -633,6 +583,7 @@ async function handleApiRequest(request, env) {
   if (method === 'POST' && path === '/api/domains') return await apiAddDomain(request, db);
   if (method === 'POST' && path === '/api/sync') return syncAllDomains(env, true);
   if (method === 'POST' && path === '/api/domains/sync_system') return syncSystemDomains(env, true);
+
   if (method === 'POST' && path === _k(['/api/pr','oxy/test_sub','script','ion'])) return await apiTestExternalSubscription(request, env);
 
   const domainMatch = path.match(/^\/api\/domains\/(\d+)$/);
@@ -656,7 +607,8 @@ async function handleApiRequest(request, env) {
   if (method === 'GET' && path === '/api/ip_sources') return await apiGetIpSources(db);
   if (method === 'POST' && path === '/api/ip_sources') return await apiAddIpSource(request, db);
   if (method === 'POST' && path === '/api/ip_sources/probe') return await apiProbeIpSource(request);
-  if (method === 'POST' && path === '/api/ip_sources/sync_all') return syncAllIpSources(env, true);
+  
+  if (method === 'POST' && path === '/api/ip_sources/sync_all') return pushAllIpSourcesToGithub(env, true);
 
   const ipSourceMatch = path.match(/^\/api\/ip_sources\/(\d+)$/);
   if (ipSourceMatch) {
@@ -668,7 +620,7 @@ async function handleApiRequest(request, env) {
   const ipSourceSyncMatch = path.match(/^\/api\/ip_sources\/(\d+)\/sync$/);
   if (ipSourceSyncMatch && method === 'POST') {
     const id = ipSourceSyncMatch[1];
-    return syncSingleIpSource(id, env, true);
+    return createLogStreamResponse((log) => syncSingleIpSourceToD1(id, env, log));
   }
 
   return jsonResponse({ error: 'API 端点未找到' }, 404);
@@ -830,7 +782,6 @@ async function apiSetSettings(request, env) {
   return jsonResponse({ success: true, message: '设置已成功保存。' });
 }
 
-
 async function apiGetDomains(request, db) {
   const query = `
     SELECT id, source_domain, target_domain, zone_id, is_deep_resolve, ttl, notes, 
@@ -885,7 +836,6 @@ async function handleDomainMutation(request, db, isUpdate = false, id = null) {
   }
 }
 
-
 async function apiAddDomain(request, db) { return handleDomainMutation(request, db, false); }
 async function apiUpdateDomain(request, db, id) { return handleDomainMutation(request, db, true, id); }
 
@@ -932,7 +882,6 @@ async function apiDeleteDomain(request, db, id) {
   
   return jsonResponse({ success: true, message: "目标及其关联的DNS记录已成功删除。" });
 }
-
 
 async function apiLiveResolveDomain(id, env) {
     try {
@@ -987,7 +936,7 @@ async function handleUiRequest(request, env) {
         }
 
         const domainsPromise = db.prepare("SELECT id, source_domain, target_domain, zone_id, is_deep_resolve, ttl, notes, resolve_record_limit, is_single_resolve, single_resolve_limit, single_resolve_node_names, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_system, displayed_records FROM domains ORDER BY is_system DESC, id").all();
-        const ipSourcesPromise = db.prepare("SELECT id, url, github_path, commit_message, fetch_strategy, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_node_generation_enabled, node_names FROM ip_sources ORDER BY github_path").all();
+        const ipSourcesPromise = db.prepare("SELECT id, url, github_path, commit_message, fetch_strategy, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_node_generation_enabled, node_names, needs_push FROM ip_sources ORDER BY github_path").all();
 
         let [{ results: domains }, { results: ipSources }] = await Promise.all([domainsPromise, ipSourcesPromise]);
         ipSources = ipSources.map(s => ({ ...s, url: _du(s.url) }));
@@ -1087,7 +1036,7 @@ legend { font-size: 1.125rem; font-weight: 600; padding: 0 .5rem; display: flex;
 .record-details ul { margin: 8px 0 0; padding-left: 20px; font-size: 0.9em; }
 .refresh-icon { cursor: pointer; color: rgb(var(--c-text-secondary)); transition: color .2s; }
 .refresh-icon:hover { color: rgb(var(--color-primary)); }
-.status-success { color: #10b981; } .status-failed { color: #f43f5e; } .status-no_change { color: rgb(var(--c-text-secondary)); }
+.status-success { color: #10b981; } .status-failed { color: #f43f5e; } .status-no_change { color: rgb(var(--c-text-secondary)); } .status-needs-push { color: #eab308; }
 .notifications { position: fixed; top: 20px; right: 20px; z-index: 1050; display: flex; flex-direction: column; gap: 10px; }
 .toast { background-color: #333; color: #fff; padding: 15px 20px; border-radius: 8px; box-shadow: var(--shadow-lg); opacity: 0; transform: translateX(100%); transition: opacity 0.4s, transform 0.4s; max-width: 350px; font-weight: 500; }
 .toast.show { opacity: 1; transform: translateX(0); }
@@ -1174,6 +1123,12 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
           }
       }
       
+      const sourceFooter = proxySettings.showSourceOnHomepage ? `
+          <div class="public-card-footer">
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.72"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.72"/></svg>
+              <span>来源: ${sourceHost}</span>
+          </div>` : '';
+
       const mainCard = `
       <div class="public-card" data-copy-content="${d.target_domain}">
           <div class="public-card-header">
@@ -1181,10 +1136,7 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
               <span class="public-card-meta">${formatTime(d.last_synced_time)}</span>
           </div>
           <div class="public-card-content">${d.target_domain}</div>
-          <div class="public-card-footer">
-              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.72"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.72"/></svg>
-              <span>来源: ${sourceHost}</span>
-          </div>
+          ${sourceFooter}
       </div>`;
       
       const cards = [mainCard];
@@ -1208,10 +1160,7 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
                               <span class="public-card-meta">${formatTime(d.last_synced_time)}</span>
                           </div>
                           <div class="public-card-content">${singleDomain}</div>
-                          <div class="public-card-footer">
-                                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.72"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.72"/></svg>
-                              <span>来源: ${sourceHost}</span>
-                          </div>
+                          ${sourceFooter}
                       </div>`;
                       cards.push(singleCard);
                   });
@@ -1225,6 +1174,12 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
 
   const ipSourceCards = ipSources.map(s => {
       const fullUrl = `${origin}/${s.github_path}`;
+      const sourceFooter = proxySettings.showSourceOnHomepage ? `
+          <div class="public-card-footer">
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.72"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.72"/></svg>
+              <span>来源: ${new URL(s.url).hostname}</span>
+          </div>` : '';
+
       return `
       <div class="public-card" data-copy-content="${fullUrl}">
           <div class="public-card-header">
@@ -1232,10 +1187,7 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
               <span class="public-card-meta">${formatTime(s.last_synced_time)}</span>
           </div>
           <div class="public-card-content">${fullUrl}</div>
-          <div class="public-card-footer">
-              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.72"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.72"/></svg>
-              <span>来源: ${new URL(s.url).hostname}</span>
-          </div>
+          ${sourceFooter}
       </div>`;
   }).join('');
 
@@ -1337,6 +1289,7 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
     
     .public-container { max-width: 1200px; margin: 1rem auto; padding: 1.5rem; }
     .public-section h2 { color: var(--text-color); font-size: 1.75rem; margin-bottom: 2rem; display: flex; align-items: center; gap: 0.75rem; border: none; padding: 0;}
+    .public-section + .public-section { margin-top: 2.5rem; }
     .public-section h2 .icon { color: var(--primary-color); }
     .public-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1.5rem; }
     .public-card {
@@ -1699,7 +1652,6 @@ function getProxySettingsPageHTML() {
   `;
 }
 
-
 async function getDashboardPage(domains, ipSources, settings) { 
   const githubSettingsComplete = settings.GITHUB_TOKEN && settings.GITHUB_OWNER && settings.GITHUB_REPO;
 
@@ -1733,9 +1685,14 @@ async function getDashboardPage(domains, ipSources, settings) {
           <article><h3>手动操作</h3><p>点击下方按钮，可以立即为所有已启用的目标执行一次同步任务。</p><button id="manualSyncBtn">手动同步所有目标</button><pre id="logOutput" style="display:none;"></pre></article>
       </div>
       <div id="page-github-upload" class="page">
-          <div class="admin-header"><h2>GitHub IP源列表</h2><button id="addIpSourceBtn" ${githubSettingsComplete ? '' : 'disabled'}>＋ 添加IP源</button></div>
+          <div class="admin-header"><h2>GitHub 每20分钟同步</h2><button id="addIpSourceBtn" ${githubSettingsComplete ? '' : 'disabled'}>＋ 添加IP源</button></div>
           <div id="ip-source-list-container"></div>
-          <article><h3>手动操作</h3><p>点击下方按钮，可以立即为所有已启用的IP源执行一次同步并上传到GitHub。</p><button id="manualSyncIpSourcesBtn">同步所有IP源</button><pre id="ipLogOutput" style="display:none;"></pre></article>
+          <article>
+            <h3>手动操作与状态</h3>
+            <p>下次自动推送到 GitHub 时间: <strong id="push-countdown">计算中...</strong></p>
+            <button id="manualSyncIpSourcesBtn">立即推送更新到 GitHub</button>
+            <pre id="ipLogOutput" style="display:none;"></pre>
+          </article>
       </div>
       <div id="page-proxy-settings" class="page">
           <div class="admin-header"><h2>${_k(['代','理'])}设置</h2></div>
@@ -1767,6 +1724,18 @@ async function getDashboardPage(domains, ipSources, settings) {
                 <label for="githubToken">GitHub Token</label><input type="password" id="githubToken" value="${settings.GITHUB_TOKEN||''}" placeholder="具有 repo 权限的 Personal Access Token"><label for="githubOwner">GitHub 用户名/组织名</label><input type="text" id="githubOwner" value="${settings.GITHUB_OWNER||''}" placeholder="例如: my-username"><label for="githubRepo">仓库名称</label><input type="text" id="githubRepo" value="${settings.GITHUB_REPO||''}" placeholder="例如: my-dns-records">
                   <details class="tutorial-details"><summary>如何获取 GitHub API 信息？</summary><div class="tutorial-content"><ol><li><strong>获取 GitHub Token:</strong><ol type="a"><li>登录 <a href="https://github.com/" target="_blank">GitHub</a>，点击右上角头像，进入 <strong>“Settings”</strong>。</li><li>在左侧菜单中，选择 <strong>“Developer settings”</strong> &rarr; <strong>“Personal access tokens”</strong> &rarr; <strong>“Tokens (classic)”</strong>。</li><li>点击 <strong>“Generate new token”</strong>，并选择 <strong>“Generate new token (classic)”</strong>。</li><li>为令牌添加描述（Note），设置合适的过期时间（Expiration）。</li><li>在 <strong>“Select scopes”</strong> 部分，勾选 <code>repo</code> 权限。</li><li>点击页面底部的 <strong>“Generate token”</strong>，并复制生成的令牌。<strong>注意：令牌仅显示一次，请妥善保管。</strong></li></ol></li><li><strong>获取用户名/组织名 和 仓库名称:</strong><ol type="a"><li><strong>用户名/组织名</strong> 就是您的GitHub个人主页URL中，github.com后面的那部分，或者您组织的主页URL。</li><li><strong>仓库名称</strong> 是您在GitHub上创建的，用来存储IP文件的仓库的名字。如果仓库不存在，系统将在第一次同步时自动为您创建为私有仓库。</li></ol></li></ol></div></details>
               </fieldset>
+              <fieldset>
+                  <legend>
+                      <svg class="icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                      首页显示设置
+                  </legend>
+                  <div class="form-group">
+                      <label class="form-control-inline">
+                          <input type="checkbox" id="showSourceOnHomepage" name="showSourceOnHomepage" role="switch">
+                          <span>显示来源</span>
+                      </label>
+                  </div>
+              </fieldset>
               <button type="submit">保存设置</button>
           </form>
       </div>
@@ -1782,7 +1751,47 @@ async function getDashboardPage(domains, ipSources, settings) {
         <h3 id="ipSourceModalTitle"></h3>
         <a href="#close" aria-label="Close" class="close" onclick="window.closeModal('ipSourceModal')">&times;</a>
     </header>
-    <form id="ipSourceForm"><input type="hidden" id="ipSourceId"><div class="grid"><label for="ip_source_url">IP源地址</label><button type="button" class="outline" id="probeBtn" style="width:auto;padding:0 1rem;">探测方案</button></div><input type="text" id="ip_source_url" placeholder="https://example.com/ip_list.txt" required><progress id="probeProgress" style="display:none;"></progress><p id="probeResult" style="font-size:0.9em;"></p><label for="github_path">GitHub 文件路径</label><input type="text" id="github_path" placeholder="IP/Cloudflare.txt" required><label for="commit_message">Commit 信息</label><input type="text" id="commit_message" placeholder="Update Cloudflare IPs" required><label for="is_node_generation_enabled"><input type="checkbox" id="is_node_generation_enabled" name="is_node_generation_enabled" role="switch">生成节点</label><div id="node_names_container" style="display: none; margin-top: 1rem;"><label for="node_names">节点名称 (每行一个)</label><textarea id="node_names" name="node_names" rows="5" placeholder="节点名称1\n节点名称2\n..."></textarea></div><footer><button type="button" class="secondary" onclick="window.closeModal('ipSourceModal')">取消</button><button type="submit" id="saveIpSourceBtn">保存</button></footer></form></article></dialog>
+    <form id="ipSourceForm">
+      <input type="hidden" id="ipSourceId">
+      <div class="grid">
+        <label for="ip_source_url">IP源地址</label>
+        <button type="button" class="outline" id="probeBtn" style="width:auto;padding:0 1rem;">探测方案</button>
+      </div>
+      <input type="text" id="ip_source_url" placeholder="https://example.com/ip_list.txt" required>
+      <progress id="probeProgress" style="display:none;"></progress>
+      <p id="probeResult" style="font-size:0.9em;"></p>
+
+      <div class="form-group">
+        <label class="form-control-inline">
+            <input type="checkbox" id="is_delayed" name="is_delayed" role="switch">
+            <span>延迟获取</span>
+        </label>
+        <div id="delay-config" style="display: none; margin-top: 0.5rem; border-left: 2px solid rgb(var(--c-border)); padding-left: 1rem;">
+          <small>在页面加载后，随机等待一段时间再抓取内容，用于对付动态加载数据的网站。</small>
+          <div class="grid" style="margin-top: 0.5rem;">
+            <input type="number" id="delay_min" placeholder="最小秒数" min="0">
+            <input type="number" id="delay_max" placeholder="最大秒数" min="0">
+          </div>
+        </div>
+      </div>
+      
+      <label for="github_path">GitHub 文件路径</label>
+      <input type="text" id="github_path" placeholder="IP/Cloudflare.txt" required>
+      <label for="commit_message">Commit 信息</label>
+      <input type="text" id="commit_message" placeholder="Update Cloudflare IPs" required>
+      
+      <label class="form-control-inline"><input type="checkbox" id="is_node_generation_enabled" name="is_node_generation_enabled" role="switch"><span>生成节点</span></label>
+      <div id="node_names_container" style="display: none; margin-top: 1rem;">
+        <label for="node_names">节点名称 (每行一个)</label>
+        <textarea id="node_names" name="node_names" rows="5" placeholder="节点名称1\n节点名称2\n..."></textarea>
+      </div>
+      
+      <footer>
+        <button type="button" class="secondary" onclick="window.closeModal('ipSourceModal')">取消</button>
+        <button type="submit" id="saveIpSourceBtn">保存</button>
+      </footer>
+    </form>
+  </article></dialog>
   <dialog id="snippetsModal"><article>
       <header>
         <h3>如何部署 Snippets 反${_k(['代','理'])}？</h3>
@@ -1830,6 +1839,7 @@ let successfulProbeStrategy = null;
 let saveProxySettingsTimeout;
 
 const formatBeijingTime = (isoStr) => { if (!isoStr) return '从未'; const d = new Date(isoStr); return new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(d).replace(/\\//g, '-'); };
+const getCurrentBeijingTime = () => new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date()).replace(/\\//g, '-');
 
 function renderLiveRecords(records) {
   if (!records || records.length === 0) return '无记录';
@@ -1838,7 +1848,17 @@ function renderLiveRecords(records) {
   return \`<details class="record-details"><summary><b>\${first.type}:</b> (共 \${records.length} 条)</summary><ul>\${records.map(r => \`<li><b>\${r.type}:</b> \${r.content}</li>\`).join('')}</ul></details>\`;
 }
 
-function renderStatus(item) { switch (item.last_sync_status) { case 'success': return \`<span class="status-success">✔ 同步成功</span>\`; case 'failed': return \`<span class="status-failed" title="\${item.last_sync_error || '未知错误'}">✖ 同步失败</span>\`; case 'no_change': return \`<span class="status-no_change">✔ 内容一致</span>\`; default: return '○ 待定'; } }
+function renderStatus(item) { 
+    if (item.needs_push) {
+        return \`<span class="status-needs-push">⧖ 待推送</span>\`;
+    }
+    switch (item.last_sync_status) { 
+        case 'success': return \`<span class="status-success">✔ 已同步</span>\`; 
+        case 'failed': return \`<span class="status-failed" title="\${item.last_sync_error || '未知错误'}">✖ 获取失败</span>\`; 
+        case 'no_change': return \`<span class="status-no_change">✔ 内容一致</span>\`; 
+        default: return '○ 待定'; 
+    } 
+}
 
 function renderDomainCard(domain) {
   let prefix = domain.target_domain;
@@ -1853,12 +1873,16 @@ function renderDomainCard(domain) {
   const sourceDisplay = isSystem ? '系统内置' : domain.source_domain;
   const displayedRecords = domain.displayed_records ? JSON.parse(domain.displayed_records) : [];
 
+  const syncAction = isSystem 
+    ? "window.syncSystemDomains(this)"
+    : \`window.individualSync(\${domain.id})\`;
+
   return \`
   <div class="domain-card \${systemClass}" id="domain-card-\${domain.id}">
       <div class="card-col"><strong>我的域名 → 克隆源</strong><span class="domain-cell" title="\${domain.target_domain}" onclick="window.copyToClipboard('\${domain.target_domain}')">\${displayContent}</span><small class="domain-cell" title="\${domain.source_domain}">\${sourceDisplay}</small></div>
       <div class="card-col"><strong>当前解析 <svg class="refresh-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" title="实时查询解析" onclick="window.refreshSingleDomainRecords(\${domain.id})"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg></strong><div id="records-container-\${domain.id}">\${renderLiveRecords(displayedRecords)}</div></div>
       <div class="card-col"><strong>上次同步</strong><div>\${renderStatus(domain)}</div><small>\${formatBeijingTime(domain.last_synced_time)}</small></div>
-      <div class="card-actions"><button class="outline" onclick="window.individualSync(\${domain.id})">同步</button><button class="outline edit-btn" onclick="window.openModal('domainModal', \${domain.id})">编辑</button><button class="outline delete-btn" onclick="window.deleteDomain(\${domain.id})" \${isSystem ? 'disabled' : ''}>删除</button></div>
+      <div class="card-actions"><button class="outline" onclick="\${syncAction}">同步</button><button class="outline edit-btn" onclick="window.openModal('domainModal', \${domain.id})">编辑</button><button class="outline delete-btn" onclick="window.deleteDomain(\${domain.id})" \${isSystem ? 'disabled' : ''}>删除</button></div>
   </div>\`;
 }
 function renderDomainList() { 
@@ -1876,8 +1900,8 @@ function renderIpSourceCard(source) {
   <div class="domain-card" id="ip-source-card-\${source.id}">
       <div class="card-col" style="flex-grow: 2;"><strong>GitHub 文件路径</strong><a href="\${fileUrl}" target="_blank" class="domain-cell" onclick="event.stopPropagation();">\${source.github_path}</a><small class="domain-cell" title="\${source.url}">源: \${source.url}</small></div>
       <div class="card-col"><strong>抓取策略</strong><span>\${source.fetch_strategy || '尚未探测'}</span></div>
-      <div class="card-col"><strong>上次同步</strong><small>\${renderStatus(source)} @ \${formatBeijingTime(source.last_synced_time)}</small></div>
-      <div class="card-actions"><button class="outline" onclick="window.syncSingleIpSource(\${source.id})">同步</button><button class="outline edit-btn" onclick="window.openModal('ipSourceModal', \${source.id})">编辑</button><button class="outline delete-btn" onclick="window.deleteIpSource(\${source.id})">删除</button></div>
+      <div class="card-col"><strong>上次获取</strong><div>\${renderStatus(source)}</div><small>\${formatBeijingTime(source.last_synced_time)}</small></div>
+      <div class="card-actions"><button class="outline" onclick="window.syncSingleIpSource(\${source.id})">立即获取</button><button class="outline edit-btn" onclick="window.openModal('ipSourceModal', \${source.id})">编辑</button><button class="outline delete-btn" onclick="window.deleteIpSource(\${source.id})">删除</button></div>
   </div>\`;
 }
 function renderIpSourceList() { 
@@ -1924,6 +1948,7 @@ window.openModal = (modalId, id = null) => {
       const limitContainer = document.getElementById('single_resolve_limit_container');
       const limitInput = document.getElementById('single_resolve_limit');
       const namesContainer = document.getElementById('single_node_names_container');
+      const recordLimitInput = document.getElementById('resolve_record_limit');
 
       function toggleSingleResolveUI() {
           const show = singleResolveSwitch.checked;
@@ -1961,17 +1986,22 @@ window.openModal = (modalId, id = null) => {
           document.getElementById('source_domain').value = domain.source_domain;
           document.getElementById('is_deep_resolve').checked = !!domain.is_deep_resolve;
           document.getElementById('ttl').value = domain.ttl;
-          document.getElementById('resolve_record_limit').value = domain.resolve_record_limit || 10;
+          recordLimitInput.value = domain.resolve_record_limit || 10;
           document.getElementById('notes').value = domain.notes;
           singleResolveSwitch.checked = !!domain.is_single_resolve;
           limitInput.value = domain.single_resolve_limit || 5;
+
+          const recordLimit = parseInt(recordLimitInput.value, 10);
+          if (parseInt(limitInput.value, 10) > recordLimit) {
+              limitInput.value = recordLimit;
+          }
           
           const showSingleUI = !!domain.is_single_resolve;
           limitContainer.style.display = showSingleUI ? 'block' : 'none';
           namesContainer.style.display = showSingleUI ? 'block' : 'none';
           if(showSingleUI) {
               const names = domain.single_resolve_node_names ? JSON.parse(domain.single_resolve_node_names) : [];
-              updateSingleNodeNameInputs(domain.single_resolve_limit || 5, names);
+              updateSingleNodeNameInputs(parseInt(limitInput.value, 10), names);
           }
 
       } else { 
@@ -1982,12 +2012,18 @@ window.openModal = (modalId, id = null) => {
       const form = document.getElementById('ipSourceForm'); form.reset();
       const nodeGenSwitch = document.getElementById('is_node_generation_enabled');
       const nodeNamesContainer = document.getElementById('node_names_container');
-      
+      const isDelayedSwitch = document.getElementById('is_delayed');
+      const delayConfig = document.getElementById('delay-config');
+
       const toggleNodeNamesUI = () => {
           nodeNamesContainer.style.display = nodeGenSwitch.checked ? 'block' : 'none';
       };
+      const toggleDelayUI = () => {
+          delayConfig.style.display = isDelayedSwitch.checked ? 'block' : 'none';
+      };
       
       nodeGenSwitch.onchange = toggleNodeNamesUI;
+      isDelayedSwitch.onchange = toggleDelayUI;
 
       successfulProbeStrategy = null;
       document.getElementById('probeProgress').style.display = 'none';
@@ -2003,6 +2039,9 @@ window.openModal = (modalId, id = null) => {
           document.getElementById('commit_message').value = source.commit_message;
           nodeGenSwitch.checked = !!source.is_node_generation_enabled;
           document.getElementById('node_names').value = source.node_names || '';
+          isDelayedSwitch.checked = !!source.is_delayed;
+          document.getElementById('delay_min').value = source.delay_min || 0;
+          document.getElementById('delay_max').value = source.delay_max || 0;
 
           if (source.fetch_strategy) {
               successfulProbeStrategy = source.fetch_strategy;
@@ -2013,8 +2052,12 @@ window.openModal = (modalId, id = null) => {
           document.getElementById('ipSourceId').value = '';
           nodeGenSwitch.checked = false;
           document.getElementById('node_names').value = '';
+          isDelayedSwitch.checked = false;
+          document.getElementById('delay_min').value = 0;
+          document.getElementById('delay_max').value = 0;
       }
       toggleNodeNamesUI();
+      toggleDelayUI();
   }
   modal.showModal();
 };
@@ -2063,13 +2106,17 @@ window.refreshSingleDomainRecords = async (id) => {
 
 async function saveIpSource() {
   const id = document.getElementById('ipSourceId').value;
+  const isDelayed = document.getElementById('is_delayed').checked;
   const payload = { 
       url: document.getElementById('ip_source_url').value, 
       github_path: document.getElementById('github_path').value, 
       commit_message: document.getElementById('commit_message').value, 
       fetch_strategy: successfulProbeStrategy,
       is_node_generation_enabled: document.getElementById('is_node_generation_enabled').checked,
-      node_names: document.getElementById('node_names').value
+      node_names: document.getElementById('node_names').value,
+      is_delayed: isDelayed,
+      delay_min: isDelayed ? parseInt(document.getElementById('delay_min').value) || 0 : 0,
+      delay_max: isDelayed ? parseInt(document.getElementById('delay_max').value) || 0 : 0,
   };
   const apiUrl = id ? \`/api/ip_sources/\${id}\` : '/api/ip_sources';
   const method = id ? 'PUT' : 'POST';
@@ -2078,37 +2125,65 @@ async function saveIpSource() {
   window.deleteIpSource = async (id) => { if (!confirm('确定要删除这个IP源及其GitHub文件吗？')) return; try { await apiFetch(\`/api/ip_sources/\${id}\`, { method: 'DELETE' }); showNotification('IP源已删除', 'success'); await refreshIpSources(); } catch(e) { showNotification(\`删除失败: code>\${e.message}</code>\`, 'error'); } }
   async function refreshIpSources() { try { currentIpSources = await apiFetch('/api/ip_sources'); renderIpSourceList(); } catch (e) { showNotification(\`更新IP源列表失败: <code>\${e.message}</code>\`, 'error'); } }
 
-async function handleStreamingRequest(url, btn, logOutputElem) {
-  const allButtons = document.querySelectorAll('button'); allButtons.forEach(b => b.disabled = true); const originalBtnText = btn ? btn.textContent : ''; if (btn) { btn.innerHTML = '同步中...'; btn.setAttribute('aria-busy', 'true'); }
+async function handleStreamingRequest(url, btn, logOutputElem, itemId) {
+  let hasError = false;
+  const allButtons = document.querySelectorAll('button'); allButtons.forEach(b => b.disabled = true); const originalBtnText = btn ? btn.textContent : ''; if (btn) { btn.innerHTML = '处理中...'; btn.setAttribute('aria-busy', 'true'); }
   logOutputElem.style.display = 'block';
-  logOutputElem.textContent = '开始同步任务...\\n';
+  logOutputElem.textContent = '开始任务...\\n';
   try { 
       const response = await fetch(url, { method: 'POST' });
-      if (!response.ok || !response.body) throw new Error(\`服务器错误: \${response.status}\`);
+      if (!response.ok || !response.body) {
+          try {
+            const err = await response.json();
+            throw new Error(err.error || \`服务器错误: \${response.status}\`);
+          } catch(e) {
+            throw new Error(\`服务器错误: \${response.status}\`);
+          }
+      }
       const reader = response.body.getReader(); 
       const decoder = new TextDecoder();
       while (true) { 
           const { done, value } = await reader.read(); 
           if (done) break; 
-          const chunk = decoder.decode(value, { stream: true }); 
+          const chunk = decoder.decode(value, { stream: true });
+          if(chunk.includes('[FATAL_ERROR]')) hasError = true;
           const lines = chunk.split('\\n\\n').filter(line => line.startsWith('data: ')); 
           for (const line of lines) { logOutputElem.textContent += line.substring(6) + '\\n'; logOutputElem.scrollTop = logOutputElem.scrollHeight; } 
       }
-      logOutputElem.textContent += '\\n同步完成，正在更新列表。';
+      logOutputElem.textContent += '\\n任务完成，正在更新列表。';
       if(logOutputElem.id === 'logOutput') await refreshDomains();
       if(logOutputElem.id === 'ipLogOutput') await refreshIpSources();
   } catch (e) { 
+      hasError = true;
       logOutputElem.textContent += '\\n发生严重错误：\\n' + e.message; 
-      showNotification('同步任务发生错误', 'error');
+      showNotification('任务发生错误', 'error');
   } finally { 
       allButtons.forEach(b => b.disabled = false);
       if (btn) { btn.innerHTML = originalBtnText; btn.removeAttribute('aria-busy'); } 
+      if(itemId && !hasError && logOutputElem.id === 'logOutput'){
+        const card = document.getElementById(\`domain-card-\${itemId}\`);
+        if(card){
+            const statusCol = card.children[2];
+            const statusDiv = statusCol.children[1];
+            const timeSmall = statusCol.children[2];
+            if(logOutputElem.textContent.includes('内容已更新')){
+                 statusDiv.innerHTML = \`<span class="status-success">✔ 已同步</span>\`;
+            } else {
+                 statusDiv.innerHTML = \`<span class="status-no_change">✔ 内容一致</span>\`;
+            }
+            timeSmall.textContent = getCurrentBeijingTime();
+        }
+      }
   }
 }
 
+window.syncSystemDomains = (btn) => {
+    handleStreamingRequest('/api/domains/sync_system', btn, document.getElementById('logOutput'));
+};
+
 window.individualSync = (id) => {
   const btn = document.querySelector(\`#domain-card-\${id} .card-actions button:first-child\`);
-  handleStreamingRequest(\`/api/domains/\${id}/sync\`, btn, document.getElementById('logOutput'));
+  handleStreamingRequest(\`/api/domains/\${id}/sync\`, btn, document.getElementById('logOutput'), id);
 };
 window.syncSingleIpSource = (id) => {
   const btn = document.querySelector(\`#ip-source-card-\${id} .card-actions button:first-child\`);
@@ -2311,7 +2386,8 @@ window.syncSingleIpSource = (id) => {
               externalSubscriptions: externalSubscriptions,
               customNodes: document.getElementById('customNodes').value,
               filterMode: document.querySelector('input[name="filterMode"]:checked').value,
-              globalFilters: document.getElementById('globalFilters').value
+              globalFilters: document.getElementById('globalFilters').value,
+              showSourceOnHomepage: document.getElementById('showSourceOnHomepage').checked
           };
           
           const oldProxySettings = currentSettings.proxySettings;
@@ -2396,6 +2472,9 @@ async function saveSettings(event) {
   const oldThreeNetworkSource = currentSettings.THREE_NETWORK_SOURCE;
   const newThreeNetworkSource = document.getElementById('threeNetworkSource').value;
 
+  const proxySettings = currentSettings.proxySettings || {};
+  proxySettings.showSourceOnHomepage = document.getElementById('showSourceOnHomepage').checked;
+
   const settingsToSave = {
       CF_API_TOKEN: document.getElementById('cfToken').value,
       CF_ZONE_ID: document.getElementById('cfZoneId').value,
@@ -2403,7 +2482,7 @@ async function saveSettings(event) {
       GITHUB_TOKEN: document.getElementById('githubToken').value,
       GITHUB_OWNER: document.getElementById('githubOwner').value,
       GITHUB_REPO: document.getElementById('githubRepo').value,
-      proxySettings: currentSettings.proxySettings 
+      proxySettings: proxySettings
   };
   try {
       const result = await apiFetch('/api/settings', { method: 'POST', body: JSON.stringify(settingsToSave) });
@@ -2412,7 +2491,7 @@ async function saveSettings(event) {
       
       if (oldThreeNetworkSource !== newThreeNetworkSource) {
           showNotification('三网优选源已更改，正在为您同步系统域名...', 'info');
-          handleStreamingRequest('/api/domains/sync_system', null, document.getElementById('logOutput'));
+          window.syncSystemDomains();
       }
 
       const newSettings = await apiFetch('/api/settings');
@@ -2432,6 +2511,29 @@ async function saveSettings(event) {
           btn.textContent = originalBtnText;
       }, 2000);
   }
+}
+
+function updateCountdown() {
+    const countdownEl = document.getElementById('push-countdown');
+    if (!countdownEl) return;
+
+    const now = new Date();
+    const minutes = now.getUTCMinutes();
+    const seconds = now.getUTCSeconds();
+
+    let minutesToNextPush = 20 - (minutes % 20);
+    if (minutes % 20 === 0 && seconds < 5) { // Grace period for the task to start
+        countdownEl.textContent = '正在推送中...';
+        return;
+    }
+    if (minutesToNextPush === 20) minutesToNextPush = 0; // It's exactly on the push minute but after the grace period
+
+    const secondsToNextPush = (minutesToNextPush * 60) - seconds;
+    
+    const displayMinutes = Math.floor(secondsToNextPush / 60);
+    const displaySeconds = secondsToNextPush % 60;
+    
+    countdownEl.textContent = \`\${String(displayMinutes).padStart(2, '0')}:\${String(displaySeconds).padStart(2, '0')}\`;
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -2464,6 +2566,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   try {
       currentSettings = await apiFetch('/api/settings');
       zoneName = currentSettings.zoneName || '';
+      if (currentSettings.proxySettings) {
+        document.getElementById('showSourceOnHomepage').checked = currentSettings.proxySettings.showSourceOnHomepage || false;
+      }
   } catch(e) {
       showNotification('加载设置失败', 'error');
   }
@@ -2494,17 +2599,31 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('domainForm').addEventListener('submit', (e) => { e.preventDefault(); saveDomain(); });
   
   const singleResolveSwitch = document.getElementById('is_single_resolve');
-  const limitInput = document.getElementById('single_resolve_limit');
+  const recordLimitInput = document.getElementById('resolve_record_limit');
+  const singleResolveLimitInput = document.getElementById('single_resolve_limit');
+  
+  recordLimitInput.addEventListener('input', () => {
+      const recordLimit = parseInt(recordLimitInput.value, 10);
+      const singleLimit = parseInt(singleResolveLimitInput.value, 10);
+      if (!isNaN(recordLimit) && singleLimit > recordLimit) {
+          singleResolveLimitInput.value = recordLimit;
+          if (singleResolveSwitch.checked) {
+               const currentNames = Array.from(document.querySelectorAll('.single-node-name-input')).map(input => input.value);
+               updateSingleNodeNameInputs(recordLimit, currentNames);
+          }
+      }
+  });
+
   singleResolveSwitch.addEventListener('change', () => {
       const show = singleResolveSwitch.checked;
       document.getElementById('single_resolve_limit_container').style.display = show ? 'block' : 'none';
       document.getElementById('single_node_names_container').style.display = show ? 'block' : 'none';
-      if(show) { updateSingleNodeNameInputs(parseInt(limitInput.value, 10)); }
+      if(show) { updateSingleNodeNameInputs(parseInt(singleResolveLimitInput.value, 10)); }
   });
-  limitInput.addEventListener('input', () => {
+  singleResolveLimitInput.addEventListener('input', () => {
       if(singleResolveSwitch.checked) {
           const currentNames = Array.from(document.querySelectorAll('.single-node-name-input')).map(input => input.value);
-          updateSingleNodeNameInputs(parseInt(limitInput.value, 10) || 0, currentNames);
+          updateSingleNodeNameInputs(parseInt(singleResolveLimitInput.value, 10) || 0, currentNames);
       }
   });
 
@@ -2529,7 +2648,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       successfulProbeStrategy = null;
 
       try {
-          const result = await apiFetch('/api/ip_sources/probe', { method: 'POST', body: JSON.stringify({ url }) });
+          const isDelayed = document.getElementById('is_delayed').checked;
+          const payload = { 
+              url,
+              is_delayed: isDelayed,
+              delay_min: isDelayed ? parseInt(document.getElementById('delay_min').value) || 0 : 0,
+              delay_max: isDelayed ? parseInt(document.getElementById('delay_max').value) || 0 : 0,
+          };
+          const result = await apiFetch('/api/ip_sources/probe', { method: 'POST', body: JSON.stringify(payload) });
           progress.setAttribute('value', '100');
           resultElem.textContent = \`探测成功！策略: \${result.strategy} | 发现 \${result.ipCount} 个IP\`;
           successfulProbeStrategy = result.strategy;
@@ -2542,24 +2668,27 @@ document.addEventListener('DOMContentLoaded', async () => {
           btn.disabled = false;
       }
   });
+  
+  updateCountdown();
+  setInterval(updateCountdown, 1000);
 });
 `;}
 
 async function apiGetIpSources(db) {
-  const { results } = await db.prepare("SELECT id, url, github_path, commit_message, fetch_strategy, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_node_generation_enabled, node_names FROM ip_sources ORDER BY github_path").all();
+  const { results } = await db.prepare("SELECT id, url, github_path, commit_message, fetch_strategy, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_node_generation_enabled, node_names, needs_push, is_delayed, delay_min, delay_max FROM ip_sources ORDER BY github_path").all();
   const decodedResults = results.map(s => ({...s, url: _du(s.url)}));
   return jsonResponse(decodedResults);
 }
 
 async function apiAddIpSource(request, db) {
-  let { url, github_path, commit_message, fetch_strategy, is_node_generation_enabled, node_names } = await request.json();
+  let { url, github_path, commit_message, fetch_strategy, is_node_generation_enabled, node_names, is_delayed, delay_min, delay_max } = await request.json();
   if (!url || !github_path || !commit_message || !fetch_strategy) {
       return jsonResponse({ error: '缺少必填字段或尚未成功探测获取策略。' }, 400);
   }
   try {
       url = _e(url);
-      await db.prepare("INSERT INTO ip_sources (url, github_path, commit_message, fetch_strategy, is_node_generation_enabled, node_names) VALUES (?, ?, ?, ?, ?, ?)")
-          .bind(url, github_path, commit_message, fetch_strategy, is_node_generation_enabled ? 1 : 0, node_names).run();
+      await db.prepare("INSERT INTO ip_sources (url, github_path, commit_message, fetch_strategy, is_node_generation_enabled, node_names, is_delayed, delay_min, delay_max) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+          .bind(url, github_path, commit_message, fetch_strategy, is_node_generation_enabled ? 1 : 0, node_names, is_delayed ? 1 : 0, delay_min || 0, delay_max || 0).run();
       return jsonResponse({ success: true, message: 'IP源添加成功。' });
   } catch (e) {
       if (e.message.includes('UNIQUE constraint failed')) return jsonResponse({ error: '该URL或GitHub文件路径已存在。' }, 409);
@@ -2568,14 +2697,14 @@ async function apiAddIpSource(request, db) {
 }
 
 async function apiUpdateIpSource(request, db, id) {
-  let { url, github_path, commit_message, fetch_strategy, is_node_generation_enabled, node_names } = await request.json();
+  let { url, github_path, commit_message, fetch_strategy, is_node_generation_enabled, node_names, is_delayed, delay_min, delay_max } = await request.json();
   if (!url || !github_path || !commit_message || !fetch_strategy) {
       return jsonResponse({ error: '缺少必填字段或尚未成功探测获取策略。' }, 400);
   }
   try {
       url = _e(url);
-      await db.prepare("UPDATE ip_sources SET url=?, github_path=?, commit_message=?, fetch_strategy=?, is_node_generation_enabled=?, node_names=? WHERE id=?")
-          .bind(url, github_path, commit_message, fetch_strategy, is_node_generation_enabled ? 1 : 0, node_names, id).run();
+      await db.prepare("UPDATE ip_sources SET url=?, github_path=?, commit_message=?, fetch_strategy=?, is_node_generation_enabled=?, node_names=?, is_delayed=?, delay_min=?, delay_max=? WHERE id=?")
+          .bind(url, github_path, commit_message, fetch_strategy, is_node_generation_enabled ? 1 : 0, node_names, is_delayed ? 1 : 0, delay_min || 0, delay_max || 0, id).run();
       return jsonResponse({ success: true, message: 'IP源更新成功。' });
   } catch (e) {
       if (e.message.includes('UNIQUE constraint failed')) return jsonResponse({ error: '该URL或GitHub文件路径已存在。' }, 409);
@@ -2619,7 +2748,7 @@ const ipv4Regex = /\b((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4
 const ipv6Regex = /(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))/gi;
 
 const FETCH_STRATEGIES = {
-  [_k(['direct','_regex'])]: async (url) => {
+  [_k(['direct','_regex'])]: async (url, options) => {
       const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
       if (!res.ok) throw new Error(`HTTP error ${res.status}`);
       const text = await res.text();
@@ -2639,22 +2768,63 @@ const FETCH_STRATEGIES = {
       
       return Array.from(ips);
   },
-  [_k(['phantomjs','_cloud'])]: async (url) => {
+  [_k(['phantomjs_cloud','_random_delay'])]: async (url, options) => {
+      let waitCondition;
+      const uouinUrl = _du(_e(_d([104,116,116,112,115,58,47,47,97,112,105,46,117,111,117,105,110,46,99,111,109,47,99,108,111,117,100,102,108,97,114,101,46,104,116,109,108])));
+
+      if (url === uouinUrl) {
+          waitCondition = { textExists: "CloudFlare优选IP仅对CDN节点IP进行优选" };
+          console.log(`Smart wait: waiting for specific text for ${url}`);
+      } else {
+          const beijingTime = new Date(new Date().getTime() + 8 * 60 * 60 * 1000);
+          const beijingDateString = beijingTime.toISOString().split('T')[0].replace(/-/g, '/');
+          waitCondition = { textExists: beijingDateString };
+          console.log(`Smart wait: waiting for today's date '${beijingDateString}' to appear.`);
+      }
+
+      const body = { 
+          url, 
+          renderType: 'html',
+          requestSettings: {
+              doneWhen: [waitCondition],
+              doneWhenTimeout: 20000
+          }
+      };
+      
       const res = await fetch(_d([104,116,116,112,115,58,47,47,80,104,97,110,116,111,109,74,115,67,108,111,117,100,46,99,111,109,47,97,112,105,47,98,114,111,119,115,101,114,47,118,50,47,97,45,100,101,109,111,45,107,101,121,45,119,105,116,104,45,108,111,119,45,113,117,111,116,97,45,112,101,114,45,105,112,45,97,100,100,114,101,115,115,47]), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, renderType: 'html' })
+          body: JSON.stringify(body)
       });
-      if (!res.ok) throw new Error(`PhantomJsCloud API error ${res.status}`);
+      if (!res.ok) {
+          const errorText = await res.text();
+          console.error("PhantomJsCloud Error Response:", errorText);
+          throw new Error(`PhantomJsCloud (Smart Wait) API error ${res.status}`);
+      }
       const text = await res.text();
       const ipv4s = text.match(ipv4Regex) || [];
       const ipv6s = text.match(ipv6Regex) || [];
       return [...new Set([...ipv4s, ...ipv6s])];
   },
-  [_k(['proxy','_codetabs'])]: async (url) => {
-      const proxyUrl = _d([104,116,116,112,115,58,47,47,97,112,105,46,99,111,100,101,116,97,98,115,46,99,111,109,47,118,49,47,112,114,111,121,121,63,113,117,101,115,116,61]) + encodeURIComponent(url);
-      const res = await fetch(proxyUrl);
-      if (!res.ok) throw new Error(`CodeTabs Proxy error ${res.status}`);
+  [_k(['phantomjs_cloud','_interactive'])]: async (url, options) => {
+      const pageLoadScript = [
+          { "scroll": { "selector": "body" } },
+          { "wait": 3000 },
+          { "scroll": { "x": 0, "y": 0 } },
+          { "wait": 2000 }
+      ];
+      const res = await fetch(_d([104,116,116,112,115,58,47,47,80,104,97,110,116,111,109,74,115,67,108,111,117,100,46,99,111,109,47,97,112,105,47,98,114,111,119,115,101,114,47,118,50,47,97,45,100,101,109,111,45,107,101,121,45,119,105,116,104,45,108,111,119,45,113,117,111,116,97,45,112,101,114,45,105,112,45,97,100,100,114,101,115,115,47]), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+              url,
+              renderType: 'html',
+              scripts: {
+                  load: pageLoadScript
+              }
+          })
+      });
+      if (!res.ok) throw new Error(`PhantomJsCloud (Interactive) API error ${res.status}`);
       const text = await res.text();
       const ipv4s = text.match(ipv4Regex) || [];
       const ipv6s = text.match(ipv6Regex) || [];
@@ -2662,40 +2832,99 @@ const FETCH_STRATEGIES = {
   },
 };
 
-async function apiProbeIpSource(request) {
-  const { url } = await request.json();
-  if (!url) return jsonResponse({ error: 'URL is required for probing.' }, 400);
+const SECOND_TIER_PROXIES = [
+  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url) => `https://cors-anywhere.herokuapp.com/${url}`,
+  (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  (url) => `https://thingproxy.freeboard.io/fetch/${url}`,
+  (url) => `https://cors.eu.org/${url}`,
+  (url) => `https://proxy.cors.sh/${url}`,
+  (url) => `https://api.crss.dev/api/get?url=${encodeURIComponent(url)}`,
+  (url) => `https://web-production-532d.up.railway.app/${url}`
+];
 
-  for (const [strategyName, strategyFn] of Object.entries(FETCH_STRATEGIES)) {
-      try {
-          const ips = await strategyFn(url);
-          if (ips && ips.length > 0) {
-              return jsonResponse({
-                  success: true,
-                  strategy: strategyName,
-                  ipCount: ips.length,
-                  sampleIps: ips.slice(0, 5)
-              });
-          }
-      } catch (e) {
-          console.log(`Strategy '${strategyName}' failed for URL '${url}': ${e.message}`);
+const SECOND_TIER_STRATEGIES = SECOND_TIER_PROXIES.map((proxyFn, index) => {
+    const name = `proxy_${index + 1}`;
+    return {
+        [name]: async (url, options) => {
+            const res = await fetch(proxyFn(url), { headers: { 'User-Agent': 'Mozilla/5.0' } });
+            if (!res.ok) throw new Error(`Proxy ${index + 1} error ${res.status}`);
+            const text = await res.text();
+            const ipv4s = text.match(ipv4Regex) || [];
+            const ipv6s = text.match(ipv6Regex) || [];
+            return [...new Set([...ipv4s, ...ipv6s])];
+        }
+    };
+}).reduce((acc, curr) => ({...acc, ...curr}), {});
+
+const ALL_STRATEGIES = {...FETCH_STRATEGIES, ...SECOND_TIER_STRATEGIES};
+
+async function probeSourceUrl(url, source) {
+  if (!url) {
+      throw new Error('URL is required for probing.');
+  }
+  
+  if (source && source.is_delayed) {
+    try {
+      const ips = await ALL_STRATEGIES['phantomjs_cloud_random_delay'](url, {});
+      if (ips && ips.length > 0) {
+        return { success: true, strategy: 'phantomjs_cloud_random_delay', ipCount: ips.length, sampleIps: ips.slice(0, 5) };
       }
+    } catch (e) {
+      console.log(`Forced delay strategy failed for URL '${url}': ${e.message}`);
+      throw new Error('配置的延迟获取策略执行失败。请检查目标网站或稍后再试。');
+    }
+    throw new Error('配置的延迟获取策略未能提取到IP。');
   }
 
-  return jsonResponse({ error: '所有探测方案均失败，无法从此URL提取IP。' }, 400);
+  const primaryStrategies = [_k(['direct','_regex']), _k(['phantomjs_cloud','_interactive'])];
+  for (const strategyName of primaryStrategies) {
+      try {
+          const ips = await ALL_STRATEGIES[strategyName](url, {});
+          if (ips && ips.length > 0) {
+              return { success: true, strategy: strategyName, ipCount: ips.length, sampleIps: ips.slice(0, 5) };
+          }
+      } catch (e) { console.log(`Tier 1 strategy '${strategyName}' failed for URL '${url}': ${e.message}`); }
+  }
+
+  for (const [strategyName, strategyFn] of Object.entries(SECOND_TIER_STRATEGIES)) {
+      try {
+          const ips = await strategyFn(url, {});
+          if (ips && ips.length > 0) {
+              return { success: true, strategy: strategyName, ipCount: ips.length, sampleIps: ips.slice(0, 5) };
+          }
+      } catch (e) { console.log(`Tier 2 strategy '${strategyName}' failed for URL '${url}': ${e.message}`); }
+  }
+  
+  throw new Error('所有探测方案均失败，无法从此URL提取IP。');
+}
+
+async function apiProbeIpSource(request) {
+  const { url, is_delayed, delay_min, delay_max } = await request.json();
+  try {
+    const tempSource = { is_delayed, delay_min, delay_max };
+    const result = await probeSourceUrl(url, tempSource);
+    return jsonResponse(result);
+  } catch (e) {
+    return jsonResponse({ error: e.message }, 400);
+  }
 }
 
 async function fetchIpsFromSource(source) {
-  const strategyFn = FETCH_STRATEGIES[source.fetch_strategy];
+  const strategyFn = ALL_STRATEGIES[source.fetch_strategy];
+
   if (!strategyFn) {
       throw new Error(`Unknown fetch strategy: ${source.fetch_strategy}`);
   }
+
   const url = _du(source.url);
-  const ips = await strategyFn(url);
+  const delayOptions = source.is_delayed ? { delay_min: source.delay_min, delay_max: source.delay_max } : {};
+  const ips = await strategyFn(url, delayOptions);
+  
   if (!ips || ips.length === 0) {
       throw new Error('No IPs found using the cached strategy.');
   }
-  return ips.sort();
+  return ips;
 }
 
 async function githubApiRequest(url, token, options = {}) {
@@ -2752,6 +2981,10 @@ async function getGitHubContent(token, owner, repo, path) {
 }
 
 async function updateFileOnGitHub({ token, owner, repo, path, content, message, log }) {
+  if (!content || content.trim() === '') {
+    throw new Error("推送内容不能为空，已中止操作。");
+  }
+
   await ensureRepoExists(token, owner, repo, log);
   
   const apiUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${owner}/${repo}/contents/${path}`;
@@ -2809,41 +3042,64 @@ function normalizeContent(text) {
     return text.split(/\r?\n/).map(line => line.trim()).filter(Boolean).join('\n');
 }
 
-async function syncSingleIpSource(id, env, returnLogs) {
-  const db = env.WUYA;
-  const syncLogic = async (log) => {
-      const githubSettings = await getGitHubSettings(db);
-      if (!githubSettings.token || !githubSettings.owner || !githubSettings.repo) {
-          throw new Error("GitHub API设置不完整。");
-      }
-      const source = await db.prepare("SELECT * FROM ip_sources WHERE id = ?").bind(id).first();
-      if (!source) throw new Error(`未找到ID为 ${id} のIP源。`);
-      
-      log(`======== 开始同步IP源: ${_du(source.url)} ========`);
-      
-      try {
-          const ips = await fetchIpsFromSource(source);
-          log(`成功获取 ${ips.length} 个IP。`);
-          
-          const newContent = ips.join('\n');
-          const oldContent = await getGitHubContent(githubSettings.token, githubSettings.owner, githubSettings.repo, source.github_path);
+async function syncSingleIpSourceToD1(id, env, log) {
+    const db = env.WUYA;
+    const AUTO_REPROBE_THRESHOLD = 2;
 
-          if (oldContent !== null && normalizeContent(newContent) === normalizeContent(oldContent)) {
-              log(`内容无变化，无需更新 GitHub。`);
-              await db.prepare("UPDATE ip_sources SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'no_change', last_sync_error = NULL WHERE id = ?").bind(id).run();
-              log(`✔ 状态更新为内容一致。`);
-              return;
-          }
-          
-          await updateFileOnGitHub({ ...githubSettings, path: source.github_path, content: newContent, message: source.commit_message, log });
-          log(`✔ 成功同步到GitHub: ${source.github_path}`);
-          
-          await db.prepare("UPDATE ip_sources SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'success', last_sync_error = NULL WHERE id = ?").bind(id).run();
-      } catch (e) {
-          log(`❌ 同步失败: ${e.message}`);
-          await db.prepare("UPDATE ip_sources SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'failed', last_sync_error = ? WHERE id = ?").bind(e.message, id).run();
-          throw e;
-      }
+    const source = await db.prepare("SELECT * FROM ip_sources WHERE id = ?").bind(id).first();
+    if (!source) throw new Error(`未找到ID为 ${id} 的IP源。`);
+
+    log(`======== 开始处理IP源: ${_du(source.url)} ========`);
+
+    if (source.consecutive_failures >= AUTO_REPROBE_THRESHOLD) {
+        log(`源 [${_du(source.url)}] 已连续失败 ${source.consecutive_failures} 次，触发自动重探测...`);
+        try {
+            const result = await probeSourceUrl(_du(source.url), source);
+            if (result.success && result.strategy) {
+                log(`✔ 自动重探测成功！新策略: ${result.strategy}`);
+                await db.prepare("UPDATE ip_sources SET fetch_strategy = ?, consecutive_failures = 0 WHERE id = ?")
+                    .bind(result.strategy, id).run();
+                source.fetch_strategy = result.strategy; 
+            } else {
+                 throw new Error("探测成功但未返回有效策略");
+            }
+        } catch (probeError) {
+            log(`❌ 自动重探测失败: ${probeError.message}. 本次跳过该源。`);
+            await db.prepare("UPDATE ip_sources SET consecutive_failures = consecutive_failures + 1 WHERE id = ?").bind(id).run();
+            return;
+        }
+    }
+    
+    try {
+        const ips = await fetchIpsFromSource(source);
+        log(`成功从源获取 ${ips.length} 个IP。`);
+        
+        const newContent = ips.join('\n');
+        const newHash = await generateHash(newContent);
+        
+        if (newHash === source.last_pushed_hash) {
+            log(`内容无变化 (与上次推送至GitHub的内容一致)，无需操作。`);
+            await db.prepare("UPDATE ip_sources SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'no_change', last_sync_error = NULL, consecutive_failures = 0, needs_push = 0 WHERE id = ?")
+                .bind(id).run();
+        } else {
+            log(`内容已更新，暂存到数据库并标记为待推送。`);
+            await db.prepare("UPDATE ip_sources SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'success', last_sync_error = NULL, consecutive_failures = 0, cached_content = ?, content_hash = ?, needs_push = 1 WHERE id = ?")
+                .bind(newContent, newHash, id).run();
+        }
+        log(`✔ IP源 [${_du(source.url)}] 处理成功。`);
+    } catch (e) {
+        log(`❌ IP源 [${_du(source.url)}] 处理失败: ${e.message}`);
+        await db.prepare("UPDATE ip_sources SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'failed', last_sync_error = ?, consecutive_failures = consecutive_failures + 1 WHERE id = ?")
+            .bind(e.message, id).run();
+        throw e;
+    }
+}
+
+async function pushAllIpSourcesToGithub(env, returnLogs) {
+  const syncLogic = async (log) => {
+      log("开始手动触发所有待推送更新到GitHub...");
+      await pushAllChangesToGithub(env, log);
+      log("手动推送任务执行完毕。");
   };
 
   if (returnLogs) return createLogStreamResponse(syncLogic);
@@ -2852,36 +3108,55 @@ async function syncSingleIpSource(id, env, returnLogs) {
   await syncLogic(noOpLog);
 }
 
-async function syncAllIpSources(env, returnLogs) {
-  const db = env.WUYA;
-  const syncLogic = async (log) => {
-      log("开始批量同步IP源...");
-      const { results: sources } = await db.prepare("SELECT * FROM ip_sources WHERE is_enabled = 1").all();
-      if (sources.length === 0) {
-          log("没有已启用的IP源需要同步。");
-          return;
-      }
-      for (const source of sources) {
-          await syncSingleIpSource(source.id, env, false).catch(e => log(`处理ID ${source.id} 失败: ${e.message}`));
-      }
-      log("所有IP源同步任务执行完毕。");
-  };
+async function pushAllChangesToGithub(env, log) {
+    const db = env.WUYA;
+    const githubSettings = await getGitHubSettings(db);
+    if (!githubSettings.token || !githubSettings.owner || !githubSettings.repo) {
+        log("❌ 推送失败: GitHub API设置不完整。");
+        return;
+    }
 
-  if (returnLogs) return createLogStreamResponse(syncLogic);
+    const { results: sourcesToPush } = await db.prepare("SELECT * FROM ip_sources WHERE needs_push = 1 AND is_enabled = 1").all();
 
-  const noOpLog = (msg) => console.log(beijingTimeLog(msg));
-  await syncLogic(noOpLog);
+    if (sourcesToPush.length === 0) {
+        log("没有需要推送到GitHub的更新。");
+        return;
+    }
+
+    log(`发现 ${sourcesToPush.length} 个IP源有更新待推送到GitHub...`);
+    await ensureRepoExists(githubSettings.token, githubSettings.owner, githubSettings.repo, log);
+
+    for (const source of sourcesToPush) {
+        log(`---\n pushing: ${source.github_path}`);
+        try {
+            await updateFileOnGitHub({ 
+                ...githubSettings, 
+                path: source.github_path, 
+                content: source.cached_content, 
+                message: source.commit_message, 
+                log 
+            });
+            
+            await db.prepare("UPDATE ip_sources SET last_pushed_hash = ?, needs_push = 0, last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'success' WHERE id = ?")
+                .bind(source.content_hash, source.id).run();
+
+            log(`✔ 成功推送 ${source.github_path} 到GitHub。`);
+
+        } catch (e) {
+            log(`❌ 推送 ${source.github_path} 失败: ${e.message}`);
+        }
+    }
 }
 
 async function handleGitHubFileProxy(fileName, env, ctx) {
   const db = env.WUYA;
+  const githubSettings = await getGitHubSettings(db);
   const source = await db.prepare("SELECT * FROM ip_sources WHERE github_path = ?").bind(fileName).first();
 
   if (!source) {
       return new Response('File not found or not managed by this service.', { status: 404 });
   }
 
-  const githubSettings = await getGitHubSettings(db);
   if (!githubSettings.token || !githubSettings.owner || !githubSettings.repo) {
       return new Response('GitHub settings are not configured on the server.', { status: 500 });
   }
@@ -2892,13 +3167,10 @@ async function handleGitHubFileProxy(fileName, env, ctx) {
 
   if (!response) {
       const apiUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${githubSettings.owner}/${githubSettings.repo}/contents/${fileName}`;
-      const headers = {
-          'Authorization': `Bearer ${githubSettings.token}`,
-          'User-Agent': `DNS-Clone-Worker-${_k(['Pro','xy'])}`,
-          'Accept': 'application/vnd.github.v3.raw' 
-      };
       
-      const githubResponse = await fetch(apiUrl, { headers });
+      const githubResponse = await githubApiRequest(apiUrl, githubSettings.token, {
+          headers: { 'Accept': 'application/vnd.github.v3.raw' }
+      });
 
       if (!githubResponse.ok) {
           return new Response('Failed to fetch file from GitHub.', { status: githubResponse.status });
@@ -2922,18 +3194,8 @@ async function syncDomainLogic(domain, token, zoneId, db, log, syncContext) {
       let recordsToUpdate;
       if (domain.source_domain.startsWith('internal:hostmonit:')) {
           const type = domain.source_domain.split(':')[2];
-          const sourceName = await getSetting(db, 'THREE_NETWORK_SOURCE') || 'CloudFlareYes';
-          log(`模式: 系统内置源 (三网优选IP - ${type}, 来源: ${sourceName})`);
-          if (!syncContext.threeNetworkIps || syncContext.threeNetworkIps.source !== sourceName) {
-              log(`正在从 ${sourceName} 获取三网优选IP...`);
-              syncContext.threeNetworkIps = await fetchThreeNetworkIps(sourceName, log);
-              syncContext.threeNetworkIps.source = sourceName;
-              const ips = syncContext.threeNetworkIps;
-              if (ips && (ips.yd.length > 0 || ips.dx.length > 0 || ips.lt.length > 0)) {
-                  log(`获取成功: 移动(${ips.yd.length}) 电信(${ips.dx.length}) 联通(${ips.lt.length})`);
-              } else {
-                  log(`未获取到任何三网IP。`);
-              }
+          if (!syncContext.threeNetworkIps) {
+              throw new Error("三网优选IP上下文未准备好, 系统域名应该由 syncSystemDomainsAsUnit 处理。");
           }
           const ips = syncContext.threeNetworkIps[type] || [];
           recordsToUpdate = ips.map(ip => ({ type: 'A', content: ip }));
@@ -2946,8 +3208,14 @@ async function syncDomainLogic(domain, token, zoneId, db, log, syncContext) {
           if (cnames.length > 0) {
               recordsToUpdate = [{ type: 'CNAME', content: cnames[0].replace(/\.$/, "") }];
           } else {
-              throw new Error(`在浅层克隆模式下，源域名 ${domain.source_domain} 必须是一个CNAME记录。`);
+              recordsToUpdate = [];
           }
+      }
+
+      if (!recordsToUpdate || recordsToUpdate.length === 0) {
+          log(`警告: 源域名 ${domain.source_domain} 未解析到任何有效记录，本次跳过更新。`);
+          await db.prepare("UPDATE domains SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'failed', last_sync_error = ? WHERE id = ?").bind('源域名无解析', domain.id).run();
+          return;
       }
 
       const recordLimit = domain.resolve_record_limit || 10;
@@ -2955,19 +3223,7 @@ async function syncDomainLogic(domain, token, zoneId, db, log, syncContext) {
           log(`解析到 ${recordsToUpdate.length} 条记录，根据上限(${recordLimit})进行截取。`);
           recordsToUpdate = recordsToUpdate.slice(0, recordLimit);
       }
-
-      if (!recordsToUpdate || recordsToUpdate.length === 0) {
-          const lastRecords = JSON.parse(domain.last_synced_records || '[]');
-          if (lastRecords.length === 0) {
-              log(`源域名 ${domain.source_domain} 未找到任何记录，与上次同步结果一致，无需操作。`);
-              await db.prepare("UPDATE domains SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'no_change', last_sync_error = NULL WHERE id = ?").bind(domain.id).run();
-              log(`✔ 同步完成 ${domain.target_domain} (内容一致)。`);
-              return;
-          } else {
-              throw new Error(`源域名 ${domain.source_domain} 未找到任何可解析的记录（上次曾有记录）。`);
-          }
-      }
-
+      
       const { allZoneRecords } = syncContext;
       const zoneName = await getZoneName(token, zoneId);
 
@@ -2982,12 +3238,15 @@ async function syncDomainLogic(domain, token, zoneId, db, log, syncContext) {
       if (targetPrefix !== domain.target_domain) {
           const singleResolveRegex = new RegExp(`^${targetPrefix.replace(/\./g, '\\.')}\\.\\d+\\.${zoneName.replace(/\./g, '\\.')}$`);
           const existingSingleRecords = allZoneRecords.filter(r => singleResolveRegex.test(r.name));
-
-          const recordsForSingleResolve = domain.is_single_resolve ? recordsToUpdate.slice(0, domain.single_resolve_limit) : [];
           
+          const recordsForSingleResolve = domain.is_single_resolve ? recordsToUpdate.slice(0, domain.single_resolve_limit || 5) : [];
+          
+          const newSingleDomainNames = new Set();
           for (let i = 0; i < recordsForSingleResolve.length; i++) {
-              const record = recordsForSingleResolve[i];
               const singleDomainName = `${targetPrefix}.${i + 1}.${zoneName}`;
+              newSingleDomainNames.add(singleDomainName);
+              
+              const record = recordsForSingleResolve[i];
               const existing = existingSingleRecords.filter(r => r.name === singleDomainName);
               const singleDomain = { ...domain, target_domain: singleDomainName };
               const changes = calculateDnsChanges(existing, [record], singleDomain);
@@ -2995,12 +3254,7 @@ async function syncDomainLogic(domain, token, zoneId, db, log, syncContext) {
               operations.push(...changes.toAdd.map(rec => ({ action: 'add', record: rec, domain: singleDomain })));
           }
           
-          const recordsToClean = existingSingleRecords.filter(r => {
-              const match = r.name.match(`^${targetPrefix.replace(/\./g, '\\.')}\\.(\\d+)\\.${zoneName.replace(/\./g, '\\.')}$`);
-              const num = match ? parseInt(match[1], 10) : 0;
-              return num > recordsForSingleResolve.length;
-          });
-
+          const recordsToClean = existingSingleRecords.filter(r => !newSingleDomainNames.has(r.name));
           operations.push(...recordsToClean.map(rec => ({ action: 'delete', record: rec })));
       }
 
@@ -3024,88 +3278,95 @@ async function syncDomainLogic(domain, token, zoneId, db, log, syncContext) {
   }
 }
 
-
-async function syncSingleDomain(id, env, returnLogs) {
+async function syncSingleDomain(id, env, returnLogs, log = console.log) {
   const db = env.WUYA;
-  const syncLogic = async (log) => {
+  const syncLogic = async (innerLog) => {
       const { token, zoneId } = await getCfApiSettings(db);
       if (!token || !zoneId) throw new Error("尚未配置 Cloudflare API 令牌或区域 ID。");
       const domain = await db.prepare("SELECT * FROM domains WHERE id = ?").bind(id).first();
       if (!domain) throw new Error(`未找到 ID 为 ${id} 的目标。`);
       if (!domain.is_enabled) {
-          log(`域名 ${domain.target_domain} 已被禁用，跳过同步。`);
+          innerLog(`域名 ${domain.target_domain} 已被禁用，跳过同步。`);
           return;
       }
       
       const allZoneRecords = await listAllDnsRecords(token, zoneId);
       const syncContext = { allZoneRecords };
-      await syncDomainLogic(domain, token, zoneId, db, log, syncContext);
+      await syncDomainLogic(domain, token, zoneId, db, innerLog, syncContext);
   };
 
   if (returnLogs) return createLogStreamResponse(syncLogic);
   
-  const noOpLog = (msg) => console.log(beijingTimeLog(msg));
-  await syncLogic(noOpLog);
+  await syncLogic(log).catch(e => log(`[ERROR] ${e.message}`));
 }
 
-async function syncAllDomains(env, returnLogs) {
+async function syncSystemDomainsAsUnit(env, log) {
+    const db = env.WUYA;
+    log("======== 开始同步三网优选域名(作为一个整体) ========");
+    
+    try {
+        const { token, zoneId } = await getCfApiSettings(db);
+        if (!token || !zoneId) throw new Error("尚未配置 Cloudflare API。");
+
+        const { results: systemDomains } = await db.prepare("SELECT * FROM domains WHERE is_enabled = 1 AND is_system = 1").all();
+        if (systemDomains.length === 0) {
+            log("没有已启用的系统域名需要同步。");
+            return;
+        }
+
+        const sourceName = await getSetting(db, 'THREE_NETWORK_SOURCE') || 'CloudFlareYes';
+        log(`正在从 ${sourceName} 获取三网优选IP...`);
+        const threeNetworkIps = await fetchThreeNetworkIps(sourceName, systemDomains, log);
+        if (!threeNetworkIps || (threeNetworkIps.yd.length === 0 && threeNetworkIps.dx.length === 0 && threeNetworkIps.lt.length === 0)) {
+            throw new Error(`从 ${sourceName} 未获取到任何三网IP。`);
+        }
+        log(`获取成功: 移动(${threeNetworkIps.yd.length}) 电信(${threeNetworkIps.dx.length}) 联通(${threeNetworkIps.lt.length})`);
+
+        const allZoneRecords = await listAllDnsRecords(token, zoneId);
+        const syncContext = { allZoneRecords, threeNetworkIps };
+
+        for (const domain of systemDomains) {
+            await syncDomainLogic(domain, token, zoneId, db, log, syncContext);
+        }
+        log("✔ 三网优选域名同步完成。");
+    } catch(e) {
+        log(`❌ 三网优选域名同步失败: ${e.message}`);
+        throw e;
+    } finally {
+        await db.prepare("UPDATE domains SET needs_sync = 0 WHERE is_system = 1").run();
+    }
+}
+
+async function syncAllDomains(env, returnLogs, log = console.log) {
   const db = env.WUYA;
-  const syncLogic = async (log) => {
-      log("开始批量同步任务...");
-      const { token, zoneId } = await getCfApiSettings(db);
-      if (!token || !zoneId) throw new Error("尚未配置 Cloudflare API 令牌或区域 ID。");
-      const { results: domains } = await db.prepare("SELECT * FROM domains WHERE is_enabled = 1").all();
-      if (domains.length === 0) {
-          log("没有需要同步的已启用目标。");
-          return;
-      }
-      log(`发现 ${domains.length} 个已启用的目标需要同步。`);
-
-      const allZoneRecords = await listAllDnsRecords(token, zoneId);
-      const syncContext = { allZoneRecords };
-
-      for (const domain of domains) {
+  const syncLogic = async (innerLog) => {
+    innerLog("开始批量同步所有域名...");
+    
+    await syncSystemDomainsAsUnit(env, innerLog).catch(e => innerLog(e.message));
+    
+    const { results: nonSystemDomains } = await db.prepare("SELECT * FROM domains WHERE is_enabled = 1 AND is_system = 0").all();
+    if (nonSystemDomains.length === 0) {
+      innerLog("没有需要同步的非系统域名。");
+    } else {
+      innerLog(`发现 ${nonSystemDomains.length} 个非系统域名需要同步。`);
+      for (const domain of nonSystemDomains) {
           try {
-              await syncDomainLogic(domain, token, zoneId, db, log, syncContext);
+            await syncSingleDomain(domain.id, env, false, innerLog);
           } catch(e) {
-              log(`处理域名 ${domain.target_domain} 失败: ${e.message}`);
+            innerLog(`处理域名 ${domain.target_domain} 失败: ${e.message}`);
           }
       }
-      log("所有目标同步任务执行完毕。");
+    }
+    innerLog("所有域名同步任务执行完毕。");
   };
 
   if (returnLogs) return createLogStreamResponse(syncLogic);
-
-  const noOpLog = (msg) => console.log(beijingTimeLog(msg));
-  await syncLogic(noOpLog);
+  
+  await syncLogic(log);
 }
 
 async function syncSystemDomains(env, returnLogs) {
-  const db = env.WUYA;
-  const syncLogic = async (log) => {
-      log("开始同步系统预设域名...");
-      const { token, zoneId } = await getCfApiSettings(db);
-      if (!token || !zoneId) throw new Error("尚未配置 Cloudflare API 令牌或区域 ID。");
-      const { results: domains } = await db.prepare("SELECT * FROM domains WHERE is_enabled = 1 AND is_system = 1").all();
-      if (domains.length === 0) {
-          log("没有需要同步的已启用系统域名。");
-          return;
-      }
-      log(`发现 ${domains.length} 个已启用的系统域名需要同步。`);
-      
-      const allZoneRecords = await listAllDnsRecords(token, zoneId);
-      const syncContext = { allZoneRecords };
-
-      for (const domain of domains) {
-          await syncDomainLogic(domain, token, zoneId, db, log, syncContext).catch(e => {});
-      }
-      log("系统域名同步任务执行完毕。");
-  };
-
-  if (returnLogs) return createLogStreamResponse(syncLogic);
-  
-  const noOpLog = (msg) => console.log(beijingTimeLog(msg));
-  await syncLogic(noOpLog);
+  return createLogStreamResponse((log) => syncSystemDomainsAsUnit(env, log));
 }
 
 async function resolveRecursively(domain, log, depth = 0) {
@@ -3120,7 +3381,7 @@ if (cnames.length > 0) {
   const cnameTarget = cnames[0].replace(/\.$/, "");
   log(`(深度 ${depth}) 发现CNAME -> ${cnameTarget}`);
   const nextRecords = await resolveRecursively(cnameTarget, log, depth + 1);
-  if (nextRecords.length > 0) {
+  if (nextRecords.length > 0 && nextRecords.some(r => r.type !== 'CNAME')) {
       return nextRecords;
   }
   log(`(深度 ${depth + 1}) CNAME ${cnameTarget} 未解析到最终IP，将直接克隆此CNAME记录。`);
@@ -3131,13 +3392,22 @@ const ipv4s = await getDnsFromDoh(domain, 'A');
 const ipv6s = await getDnsFromDoh(domain, 'AAAA');
 const validIPv4s = ipv4s.filter(ip => /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(ip));
 const validIPv6s = ipv6s.filter(ip => ipv6Regex.test(ip));
-return [...validIPv4s.map(ip => ({ type: 'A', content: ip })), ...validIPv6s.map(ip => ({ type: 'AAAA', content: ip }))];
+const records = [...validIPv4s.map(ip => ({ type: 'A', content: ip })), ...validIPv6s.map(ip => ({ type: 'AAAA', content: ip }))];
+return records;
 }
 
 function calculateDnsChanges(existingRecords, newRecords, domain) {
-  const { ttl } = domain;
+  const { ttl, is_single_resolve } = domain;
+  
   const toDelete = [];
-  const toAdd = newRecords.map(r => ({ ...r, content: r.content.replace(/\.$/, "") }));
+  let toAdd = newRecords.map(r => ({ ...r, content: r.content.replace(/\.$/, "") }));
+
+  if (!is_single_resolve) {
+      const sortFn = (a, b) => a.content.localeCompare(b.content);
+      toAdd.sort(sortFn);
+      existingRecords = [...existingRecords].sort(sortFn);
+  }
+
   const newRecordIsCname = toAdd.some(r => r.type === 'CNAME');
 
   for (const existing of existingRecords) {
@@ -3219,9 +3489,9 @@ async function isAuthenticated(request, db) { const token = getCookie(request, '
 function getCookie(request, name) { const cookieHeader = request.headers.get('Cookie'); if (cookieHeader) for (let cookie of cookieHeader.split(';')) { const [key, value] = cookie.trim().split('='); if (key === name) return value; } return null; }
 function jsonResponse(data, status = 200, headers = {}) { return new Response(JSON.stringify(data, null, 2), { status, headers: { 'Content-Type': 'application/json;charset=UTF-8', ...headers } }); }
 const beijingTimeLog = (message) => `[${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}] ${message}`;
-async function getDnsFromDoh(domain, type) { try { const url = `${_d([104,116,116,112,115,58,47,47,99,108,111,117,100,102,108,97,114,101,45,100,110,115,46,99,111,109,47,100,110,115,45,113,117,101,114,121,63,110,97,109,101,61])}${encodeURIComponent(domain)}&type=${type}`; const response = await fetch(url, { headers: { 'accept': 'application/dns-json' } }); if (!response.ok) { console.warn(`DoH query failed for ${domain} (${type}): ${response.statusText}`); return []; } const data = await response.json(); return data.Answer ? data.Answer.map(ans => ans.data).filter(Boolean) : []; } catch (e) { console.error(`DoH query error for ${domain} (${type}): ${e.message}`); return []; } }
+async function getDnsFromDoh(domain, type) { try { const url = `${_d([104,116,116,112,115,58,47,47,99,108,111,117,100,102,108,97,114,101,45,100,110,115,46,99,111,109,47,100,110,115,45,113,117,101,114,121,63,110,97,109,101,61])}${encodeURIComponent(domain)}&type=${type}`; const response = await fetch(url, { headers: { 'accept': 'application/dns-json' }, cache: "no-store" }); if (!response.ok) { console.warn(`DoH query failed for ${domain} (${type}): ${response.statusText}`); return []; } const data = await response.json(); return data.Answer ? data.Answer.map(ans => ans.data).filter(Boolean) : []; } catch (e) { console.error(`DoH query error for ${domain} (${type}): ${e.message}`); return []; } }
 
-async function fetchThreeNetworkIps(source, log) {
+async function fetchThreeNetworkIps(source, systemDomains, log) {
   log(`正在从源 [${source}] 获取IP...`);
 
   async function parseHtmlTableWithOperator(htmlContent) {
@@ -3254,296 +3524,321 @@ async function fetchThreeNetworkIps(source, log) {
           if (ips.lt.size === 0) ips.lt = allIps;
       }
       
-      return { yd: Array.from(ips.yd), dx: Array.from(ips.dx), lt: Array.from(ips.lt) };
+      const limits = {
+          yd: systemDomains.find(d => d.source_domain.endsWith(':yd'))?.resolve_record_limit || 3,
+          dx: systemDomains.find(d => d.source_domain.endsWith(':dx'))?.resolve_record_limit || 3,
+          lt: systemDomains.find(d => d.source_domain.endsWith(':lt'))?.resolve_record_limit || 3
+      };
+      
+      return { 
+          yd: Array.from(ips.yd).slice(0, limits.yd), 
+          dx: Array.from(ips.dx).slice(0, limits.dx), 
+          lt: Array.from(ips.lt).slice(0, limits.lt)
+      };
   }
 
   try {
       let url;
-      let usePhantom = false;
+      let strategy;
       switch (source) {
           case 'api.uouin.com':
               url = _d([104,116,116,112,115,58,47,47,97,112,105,46,117,111,117,105,110,46,99,111,109,47,99,108,111,117,100,102,108,97,114,101,46,104,116,109,108]);
+              strategy = ALL_STRATEGIES['phantomjs_cloud_interactive'];
               break;
           case 'wetest.vip':
               url = _d([104,116,116,112,115,58,47,47,119,119,119,46,119,101,116,101,115,116,46,118,105,112,47,112,97,103,101,47,99,108,111,117,100,102,108,97,114,101,47,97,100,100,114,101,115,115,95,118,52,46,104,116,109,108]);
+              strategy = async (u) => {
+                  const res = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+                  if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+                  return res.text();
+              };
               break;
           case 'CloudFlareYes':
           default:
               url = _d([104,116,116,112,115,58,47,47,115,116,111,99,107,46,104,111,115,116,109,111,110,105,116,46,99,111,109,47,67,108,111,117,100,70,108,97,114,101,89,101,115]);
-              usePhantom = true;
+              strategy = ALL_STRATEGIES['phantomjs_cloud_interactive'];
               break;
       }
-
-      let htmlContent;
-      if (usePhantom) {
-          const fetchUrl = _d([104,116,116,112,115,58,47,47,80,104,97,110,116,111,109,74,115,67,108,111,117,100,46,99,111,109,47,97,112,105,47,98,114,111,119,115,101,114,47,118,50,47,97,45,100,101,109,111,45,107,101,121,45,119,105,116,104,45,108,111,119,45,113,117,111,116,97,45,112,101,114,45,105,112,45,97,100,100,114,101,115,115,47]);
-          const response = await fetch(fetchUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ url: url, renderType: 'html' })
-          });
-          if (!response.ok) throw new Error(`获取 ${url} 失败: ${response.statusText}`);
-          htmlContent = await response.text();
-      } else {
-          const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }});
-          if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-          htmlContent = await response.text();
-      }
       
+      const htmlContent = await strategy(url);
       return await parseHtmlTableWithOperator(htmlContent);
 
   } catch (e) {
-      log(`从源 [${source}] 获取IP失败: ${e.message}`);
-      return { yd: [], dx: [], lt: [] };
-  }
+    log(`从源 [${source}] 获取IP失败: ${e.message}`);
+    return { yd: [], dx: [], lt: [] };
+}
 }
 
 async function syncExternalSubscription(sub, db, log) {
-    const { url } = sub;
-    try {
-        log(`Fetching external sub: ${url}`);
-        const rawContent = await fetchAndParseExternalSubscription(url);
-
-        if (rawContent !== null) {
-            const nodeCount = rawContent.trim().split('\n').filter(Boolean).length;
-            log(`Success: Found ${nodeCount} valid nodes.`);
-            await db.prepare("INSERT INTO external_nodes (url, content, status, last_updated, error) VALUES (?, ?, 'success', CURRENT_TIMESTAMP, NULL) ON CONFLICT(url) DO UPDATE SET content=excluded.content, status='success', last_updated=CURRENT_TIMESTAMP, error=NULL")
-                .bind(_e(url), rawContent).run();
-        } else {
-            throw new Error("No valid content returned from parser.");
-        }
-    } catch (e) {
-        log(`Failed to fetch/parse sub ${url}: ${e.message}`);
-        await db.prepare("INSERT INTO external_nodes (url, status, last_updated, error) VALUES (?, 'failed', CURRENT_TIMESTAMP, ?) ON CONFLICT(url) DO UPDATE SET status='failed', last_updated=CURRENT_TIMESTAMP, error=excluded.error")
-            .bind(_e(url), e.message).run();
-    }
-}
-
-function parseFilterRules(filters) {
-  if (!filters) return [];
-  return filters.split('\n').filter(Boolean).map(line => {
-      line = line.trim();
-if (line.startsWith('#M:') || line.startsWith('#H:')) {
-          const type = line.substring(0, 3);
-          const ruleContent = line.substring(3);
-          const parts = ruleContent.split('=');
-          if (parts.length === 2) {
-              const [match, replacement] = parts.map(s => s.trim());
-              if (match) {
-                  return { type, match, replacement };
-              }
-          }
-      } else if (line.startsWith('#T:') || line.startsWith('#W:')) {
-          const type = line.substring(0, 3);
-          const replacement = line.substring(3).trim();
-          return { type, replacement };
-      }
-      return null;
-  }).filter(Boolean);
-}
-
-function applyContentFilters(content, filters) {
-  if (!filters) return content;
-
-  const rules = parseFilterRules(filters);
-  if (rules.length === 0) return content;
-
-  const lines = content.split('\n');
-  const processedLines = lines.map(line => {
-      const parts = line.split('#');
-      if (parts.length < 2) return line;
-
-      let addressPort = parts[0];
-      let remarks = parts.slice(1).join('#');
-      const [address, port] = addressPort.split(':');
-      let newAddress = address;
-
-      for (const rule of rules) {
-          switch(rule.type) {
-              case '#H:':
-                  if (newAddress.includes(rule.match)) {
-                      newAddress = newAddress.replace(new RegExp(rule.match, 'g'), rule.replacement);
-                  }
-                  break;
-              case '#M:':
-                  if (remarks.includes(rule.match)) {
-                      remarks = remarks.replace(new RegExp(rule.match, 'g'), rule.replacement);
-                  }
-                  break;
-              case '#T:':
-                  remarks = rule.replacement + remarks;
-                  break;
-              case '#W:':
-                  remarks = remarks + rule.replacement;
-                  break;
-          }
-      }
-      return `${newAddress}:${port}#${remarks}`;
-  });
-
-  return processedLines.join('\n');
-}
-
-async function fetchAndParseExternalSubscription(url) {
-  if(!url) return null;
+  const { url } = sub;
   try {
-      const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Cache-Control': 'no-cache' } });
-      if (!response.ok) return null;
-      
-      let content = await response.text();
+      log(`Fetching external sub: ${url}`);
+      const rawContent = await fetchAndParseExternalSubscription(url);
 
-      if (content.trim().startsWith('<')) {
-          const jsRegex = /copyURL\(\)\{navigator\.clipboard\.writeText\('([^']+)'\)/;
-          const jsMatch = content.match(jsRegex);
-          const subUrl = jsMatch ? jsMatch[1] : (content.match(/https:\/\/baidu\.sosorg\.nyc\.mn\/sub\?[^"'\s<]+/) || [])[0];
-
-          if (subUrl) {
-              const subResponse = await fetch(subUrl);
-              if (!subResponse.ok) return null;
-              content = await subResponse.text();
-          } else {
-              return null;
-          }
+      if (rawContent !== null) {
+          const nodeCount = rawContent.trim().split('\n').filter(Boolean).length;
+          log(`Success: Found ${nodeCount} valid nodes.`);
+          await db.prepare("INSERT INTO external_nodes (url, content, status, last_updated, error) VALUES (?, ?, 'success', CURRENT_TIMESTAMP, NULL) ON CONFLICT(url) DO UPDATE SET content=excluded.content, status='success', last_updated=CURRENT_TIMESTAMP, error=NULL")
+              .bind(_e(url), rawContent).run();
+      } else {
+          throw new Error("No valid content returned from parser.");
       }
-
-      try {
-          const decoded = atob(content);
-          if (decoded) content = decoded;
-      } catch (e) { }
-      
-      return processSubscriptionContent(content.split('\n'));
-  } catch (error) {
-      console.error(`处理外部订阅 ${url} 失败: ${error.message}`);
-      return null;
+  } catch (e) {
+      log(`Failed to fetch/parse sub ${url}: ${e.message}`);
+      await db.prepare("INSERT INTO external_nodes (url, status, last_updated, error) VALUES (?, 'failed', CURRENT_TIMESTAMP, ?) ON CONFLICT(url) DO UPDATE SET status='failed', last_updated=CURRENT_TIMESTAMP, error=excluded.error")
+          .bind(_e(url), e.message).run();
   }
 }
 
+function parseFilterRules(filters) {
+if (!filters) return [];
+return filters.split('\n').filter(Boolean).map(line => {
+    line = line.trim();
+    if (line.startsWith('#M:') || line.startsWith('#H:')) {
+        const type = line.substring(0, 3);
+        const ruleContent = line.substring(3);
+        const parts = ruleContent.split('=');
+        if (parts.length === 2) {
+            const [match, replacement] = parts.map(s => s.trim());
+            if (match) {
+                return { type, match, replacement };
+            }
+        }
+    } else if (line.startsWith('#T:') || line.startsWith('#W:')) {
+        const type = line.substring(0, 3);
+        const replacement = line.substring(3).trim();
+        return { type, replacement };
+    }
+    return null;
+}).filter(Boolean);
+}
+
+function applyContentFilters(content, filters) {
+if (!filters) return content;
+
+const rules = parseFilterRules(filters);
+if (rules.length === 0) return content;
+
+const lines = content.split('\n');
+const processedLines = lines.map(line => {
+    const parts = line.split('#');
+    if (parts.length < 2) return line;
+
+    let addressPort = parts[0];
+    let remarks = parts.slice(1).join('#');
+    const [address, port] = addressPort.split(':');
+    let newAddress = address;
+
+    for (const rule of rules) {
+        switch(rule.type) {
+            case '#H:':
+                if (newAddress.includes(rule.match)) {
+                    newAddress = newAddress.replace(new RegExp(rule.match, 'g'), rule.replacement);
+                }
+                break;
+            case '#M:':
+                if (remarks.includes(rule.match)) {
+                    remarks = remarks.replace(new RegExp(rule.match, 'g'), rule.replacement);
+                }
+                break;
+            case '#T:':
+                remarks = rule.replacement + remarks;
+                break;
+            case '#W:':
+                remarks = remarks + rule.replacement;
+                break;
+        }
+    }
+    return `${newAddress}:${port}#${remarks}`;
+});
+
+return processedLines.join('\n');
+}
+
+async function fetchAndParseExternalSubscription(url) {
+if(!url) return null;
+try {
+    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Cache-Control': 'no-cache' } });
+    if (!response.ok) return null;
+    
+    let content = await response.text();
+
+    if (content.trim().startsWith('<')) {
+        const jsRegex = /copyURL\(\)\{navigator\.clipboard\.writeText\('([^']+)'\)/;
+        const jsMatch = content.match(jsRegex);
+        const subUrl = jsMatch ? jsMatch[1] : (content.match(/https:\/\/baidu\.sosorg\.nyc\.mn\/sub\?[^"'\s<]+/) || [])[0];
+
+        if (subUrl) {
+            const subResponse = await fetch(subUrl);
+            if (!subResponse.ok) return null;
+            content = await subResponse.text();
+        } else {
+            return null;
+        }
+    }
+
+    try {
+        const decoded = atob(content);
+        if (decoded) content = decoded;
+    } catch (e) { }
+    
+    return processSubscriptionContent(content.split('\n'));
+} catch (error) {
+    console.error(`处理外部订阅 ${url} 失败: ${error.message}`);
+    return null;
+}
+}
+
 function processSubscriptionContent(lines) {
-  const output = [];
-  const domainRegex = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$/;
-  const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
-  const ipv6Regex = /(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))/i;
+const output = [];
+const domainRegex = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$/;
+const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+const ipv6Regex = /(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))/i;
 
-  lines.forEach(line => {
-      line = line.trim();
-      if (!line) return;
+lines.forEach(line => {
+    line = line.trim();
+    if (!line) return;
 
-      let nodeInfo = null;
+    let nodeInfo = null;
 
-      if (line.startsWith(_k(['vle','ss','://'])) || line.startsWith('vmess://')) {
-          nodeInfo = parseShareLink(line);
-      } else if (line.includes(':') && line.includes('#')) {
-          const parts = line.split('#');
-          if (parts.length >= 2) {
-              const addressPort = parts[0];
-              const originalRemarks = parts.slice(1).join('#');
-              const [address, portStr] = addressPort.split(':');
-              const port = parseInt(portStr, 10);
-              nodeInfo = { address, port, remarks: originalRemarks };
-          }
-      }
+    if (line.startsWith(_k(['vle','ss','://'])) || line.startsWith('vmess://')) {
+        nodeInfo = parseShareLink(line);
+    } else if (line.includes(':') && line.includes('#')) {
+        const parts = line.split('#');
+        if (parts.length >= 2) {
+            const addressPort = parts[0];
+            const originalRemarks = parts.slice(1).join('#');
+            const [address, portStr] = addressPort.split(':');
+            const port = parseInt(portStr, 10);
+            nodeInfo = { address, port, remarks: originalRemarks };
+        }
+    }
 
-      if (nodeInfo) {
-          const { address, port, remarks } = nodeInfo;
-          const isValidAddress = domainRegex.test(address) || ipv4Regex.test(address) || ipv6Regex.test(address);
-          const isValidPort = !isNaN(port) && port > 0 && port < 65536;
+    if (nodeInfo) {
+        const { address, port, remarks } = nodeInfo;
+        const isValidAddress = domainRegex.test(address) || ipv4Regex.test(address) || ipv6Regex.test(address);
+        const isValidPort = !isNaN(port) && port > 0 && port < 65536;
 
-          if (isValidAddress && isValidPort) {
-              const newRemarks = formatRemarks(remarks, address);
-              output.push(`${address}:${port}#${newRemarks}`);
-          }
-      }
-  });
-  return output.join('\n');
+        if (isValidAddress && isValidPort) {
+            const newRemarks = formatRemarks(remarks, address);
+            output.push(`${address}:${port}#${newRemarks}`);
+        }
+    }
+});
+return output.join('\n');
 }
 
 function formatRemarks(originalRemarks, address) {
 const chineseRegex = /^[\u4e00-\u9fa5]/;
 if (chineseRegex.test(originalRemarks.trim())) {
-  return address;
+return address;
 }
 const letterRegex = /^[A-Za-z]{2,3}/;
 const letterMatch = originalRemarks.trim().match(letterRegex);
 if (letterMatch) {
-  return letterMatch[0];
+return letterMatch[0];
 }
 return originalRemarks;
 }
 
 function parseShareLink(link) {
-  try {
-      if (link.startsWith('vmess://')) {
-          const decoded = JSON.parse(atob(link.substring(8)));
-          const address = decoded.add;
-          const port = parseInt(decoded.port, 10);
-          const remarks = decoded.ps || decoded.add;
-          return { address, port, remarks };
-      } else {
-          const url = new URL(link);
-          const address = url.hostname;
-          const port = parseInt(url.port, 10) || 443;
-          const remarks = decodeURIComponent(url.hash.substring(1));
-          return { address, port, remarks };
-      }
-  } catch (e) {
-      return null;
-  }
+try {
+    if (link.startsWith('vmess://')) {
+        const decoded = JSON.parse(atob(link.substring(8)));
+        const address = decoded.add;
+        const port = parseInt(decoded.port, 10);
+        const remarks = decoded.ps || decoded.add;
+        return { address, port, remarks };
+    } else {
+        const url = new URL(link);
+        const address = url.hostname;
+        const port = parseInt(url.port, 10) || 443;
+        const remarks = decodeURIComponent(url.hash.substring(1));
+        return { address, port, remarks };
+    }
+} catch (e) {
+    return null;
+}
 }
 
 function parseExternalNodes(content, proxySettings, request) {
-  const lines = content.split('\n').filter(Boolean);
-  const requestHostname = new URL(request.url).hostname;
-  let sniHost = requestHostname;
-  if (proxySettings.useProxyUrlForSni) {
-      try {
-          sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
-      } catch (e) { }
-  }
-  const path = proxySettings.wsReverseProxyPath || '/';
-  const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
-  const specificUuid = proxySettings.wsReverseProxySpecificUuid;
+const lines = content.split('\n').filter(Boolean);
+const requestHostname = new URL(request.url).hostname;
+let sniHost = requestHostname;
+if (proxySettings.useProxyUrlForSni) {
+    try {
+        sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
+    } catch (e) { }
+}
+const path = proxySettings.wsReverseProxyPath || '/';
+const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
+const specificUuid = proxySettings.wsReverseProxySpecificUuid;
 
-  return lines.map(line => {
-      const parts = line.split('#');
-      const addressPort = parts[0];
-      const remarks = parts.slice(1).join('#');
-      const [address, port] = addressPort.split(':');
-      
-      const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
-      const encodedPath = encodeURIComponent(encodeURIComponent(path));
-      
-      return `${_k(['vle','ss'])}://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
-  });
+return lines.map(line => {
+    const parts = line.split('#');
+    const addressPort = parts[0];
+    const remarks = parts.slice(1).join('#');
+    const [address, port] = addressPort.split(':');
+    
+    const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
+    const encodedPath = encodeURIComponent(encodeURIComponent(path));
+    
+    return `${_k(['vle','ss'])}://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
+});
 }
 
 function parseCustomNodes(content, proxySettings, request) {
-  if (!content) return [];
-  const lines = content.split('\n').filter(Boolean);
-  const requestHostname = new URL(request.url).hostname;
-  let sniHost = requestHostname;
-  if (proxySettings.useProxyUrlForSni) {
-      try {
-          sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
-      } catch (e) { }
+if (!content) return [];
+const lines = content.split('\n').filter(Boolean);
+const requestHostname = new URL(request.url).hostname;
+let sniHost = requestHostname;
+if (proxySettings.useProxyUrlForSni && proxySettings.wsReverseProxyUrl) {
+    try {
+        sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
+    } catch (e) { }
+}
+const globalPath = proxySettings.wsReverseProxyPath || '/';
+const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
+const specificUuid = proxySettings.wsReverseProxySpecificUuid;
+
+return lines.map(line => {
+    const pathParts = line.split('@');
+    const mainPart = pathParts[0];
+    const customPath = pathParts.length > 1 ? pathParts[1] : null;
+
+    const remarkParts = mainPart.split('#');
+    const addressPort = remarkParts[0];
+    const remarks = remarkParts.slice(1).join('#');
+    const [address, port] = addressPort.split(':');
+    
+    const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
+    const finalPath = customPath ? `/${customPath.replace(/^\//, '')}` : globalPath;
+    const encodedPath = encodeURIComponent(encodeURIComponent(finalPath));
+    
+    return `${_k(['vle','ss'])}://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
+});
+}
+
+async function syncAllIpSourcesToD1(env, log) {
+    const db = env.WUYA;
+    const { results: sources } = await db.prepare(
+        "SELECT * FROM ip_sources WHERE is_enabled = 1"
+    ).all();
+
+    if (sources.length === 0) {
+        log("IP Source Sync: No sources to process.");
+        return 0;
+    }
+
+    log(`IP Source Sync: Found ${sources.length} sources to process.`);
+    let processedCount = 0;
+    for (const source of sources) {
+        try {
+          await syncSingleIpSourceToD1(source.id, env, log);
+          processedCount++;
+      } catch (e) {
+          log(`IP Source Sync: Error processing source ID ${source.id}: ${e.message}`);
+      }
   }
-  const globalPath = proxySettings.wsReverseProxyPath || '/';
-  const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
-  const specificUuid = proxySettings.wsReverseProxySpecificUuid;
-
-  return lines.map(line => {
-      const pathParts = line.split('@');
-      const mainPart = pathParts[0];
-      const customPath = pathParts.length > 1 ? pathParts[1] : null;
-
-      const remarkParts = mainPart.split('#');
-      const addressPort = remarkParts[0];
-      const remarks = remarkParts.slice(1).join('#');
-      const [address, port] = addressPort.split(':');
-      
-      const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
-      const finalPath = customPath ? `/${customPath.replace(/^\//, '')}` : globalPath;
-      const encodedPath = encodeURIComponent(encodeURIComponent(finalPath));
-      
-      return `${_k(['vle','ss'])}://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
-  });
+  return processedCount;
 }
