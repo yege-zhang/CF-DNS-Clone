@@ -123,6 +123,17 @@ export default {
       } catch (e) {
           log(`Scheduled task error: ${e.message}`);
       }
+      
+      // 兜底：如有待推送的源，顺手触发一次批量推送至 GitHub
+      try {
+          const pending = await db.prepare("SELECT COUNT(1) AS c FROM ip_sources WHERE needs_push = 1 AND is_enabled = 1").first();
+          if (pending && pending.c > 0) {
+              log(`检测到 ${pending.c} 个源待推送，执行兜底 GitHub 推送...`);
+              await pushAllChangesToGithub(env, log);
+          }
+      } catch (e) {
+          log(`兜底推送检查失败：${e.message}`);
+      }
       log("Scheduled task for this cycle finished.");
   },
 };
@@ -3003,7 +3014,7 @@ async function updateFileOnGitHub({ token, owner, repo, path, content, message, 
       sha
   });
 
-  await githubApiRequest(apiUrl, token, { method: 'PUT', body });
+  await githubApiRequest(apiUrl, token, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body });
 }
 
 function createLogStreamResponse(logFunction) {
@@ -3085,6 +3096,30 @@ async function syncSingleIpSourceToD1(id, env, log) {
             log(`内容已更新，暂存到数据库并标记为待推送。`);
             await db.prepare("UPDATE ip_sources SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'success', last_sync_error = NULL, consecutive_failures = 0, cached_content = ?, content_hash = ?, needs_push = 1 WHERE id = ?")
                 .bind(newContent, newHash, id).run();
+        // 实时推送到 GitHub（若配置完整）
+        try {
+            const githubSettings = await getGitHubSettings(db);
+            if (githubSettings.token && githubSettings.owner && githubSettings.repo && source.github_path) {
+                await ensureRepoExists(githubSettings.token, githubSettings.owner, githubSettings.repo, log);
+                await updateFileOnGitHub({
+                    token: githubSettings.token,
+                    owner: githubSettings.owner,
+                    repo: githubSettings.repo,
+                    path: source.github_path,
+                    content: newContent,
+                    message: source.commit_message || `Update ${source.github_path}`,
+                    log
+                });
+                await db.prepare("UPDATE ip_sources SET last_pushed_hash = ?, needs_push = 0 WHERE id = ?")
+                    .bind(newHash, id).run();
+                log(`✔ 已实时推送到 GitHub：${source.github_path}`);
+            } else {
+                log("ℹ 跳过实时推送：GitHub 设置不完整或该源未设置 github_path。");
+            }
+        } catch (pushErr) {
+            log(`❌ 实时推送失败：${pushErr.message}（保留 needs_push=1 以便后续批量兜底）`);
+        }
+
         }
         log(`✔ IP源 [${_du(source.url)}] 处理成功。`);
     } catch (e) {
