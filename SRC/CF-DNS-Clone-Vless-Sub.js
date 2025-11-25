@@ -166,7 +166,7 @@ async function handleNodeListRequest(request, env, id) {
       const githubSettings = await getGitHubSettings(env.WUYA);
 
       const internalNodes = generateInternalNodes(domains, proxySettings, request);
-      const customNodes = parseCustomNodes(proxySettings.customNodes, proxySettings, request);
+      const customNodes = await parseCustomNodes(proxySettings.customNodes, proxySettings, request);
       
       const { results: ipSourcesForNodes } = await env.WUYA.prepare('SELECT github_path, node_names FROM ip_sources WHERE is_enabled = 1 AND is_node_generation_enabled = 1').all();
       const ipSourceNodes = await generateIpSourceNodes(ipSourcesForNodes, githubSettings, proxySettings, request);
@@ -1586,10 +1586,20 @@ function getProxySettingsPageHTML() {
                   自定义节点
               </legend>
               <div class="form-group">
-                  <label for="customNodes">每行一个节点 (地址:端口#名称@路径)</label>
-                  <textarea id="customNodes" name="customNodes" rows="4" placeholder="1.1.1.1:10086#乌鸦@/?ed=2560\nexample.com:443#示例"></textarea>
-                  <small>@路径 部分为可选，如果留空则使用上方 ${_k(['代','理','参','数'])} 中的全局 Path。</small>
-              </div>
+    <label for="customNodes">自定义节点 (支持 ADDAPI / IPv6 / 自动端口)</label>
+    <textarea id="customNodes" name="customNodes" rows="6" placeholder="📝 格式示例：
+• 域名/IPv4: www.visa.cn#优选域名 (默认443)
+• 指定端口: 127.0.0.1:1234#CFnat
+• IPv6: [2606:4700::]:2053#IPv6地址
+• ADDAPI: https://example.com/api.txt
+• 带路径: example.com:443#名称@/?ed=2048"></textarea>
+    <small>
+        1. <strong>#备注</strong> 和 <strong>@路径</strong> 为可选。<br>
+        2. 如果不写端口，默认为 <strong>443</strong>。<br>
+        3. 输入 <strong>http(s)://</strong> 开头的链接会作为 <strong>API</strong> 自动抓取文本内容，每行一条地址。
+    </small>
+</div>
+
           </fieldset>
 
           <fieldset>
@@ -3822,37 +3832,120 @@ return lines.map(line => {
 });
 }
 
-function parseCustomNodes(content, proxySettings, request) {
-if (!content) return [];
-const lines = content.split('\n').filter(Boolean);
-const requestHostname = new URL(request.url).hostname;
-let sniHost = requestHostname;
-if (proxySettings.useProxyUrlForSni && proxySettings.wsReverseProxyUrl) {
-    try {
-        sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
-    } catch (e) { }
-}
-const globalPath = proxySettings.wsReverseProxyPath || '/';
-const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
-const specificUuid = proxySettings.wsReverseProxySpecificUuid;
-
-return lines.map(line => {
-    const pathParts = line.split('@');
-    const mainPart = pathParts[0];
-    const customPath = pathParts.length > 1 ? pathParts[1] : null;
-
-    const remarkParts = mainPart.split('#');
-    const addressPort = remarkParts[0];
-    const remarks = remarkParts.slice(1).join('#');
-    const [address, port] = addressPort.split(':');
+// 支持 ADDAPI / IPv6 / 默认 443 端口 的自定义节点解析
+async function parseCustomNodes(content, proxySettings, request) {
+    if (!content) return [];
     
-    const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
-    const finalPath = customPath ? `/${customPath.replace(/^\//, '')}` : globalPath;
-    const encodedPath = encodeURIComponent(encodeURIComponent(finalPath));
-    
-    return `${_k(['vle','ss'])}://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
-});
+    // 1. SNI / Path / UUID 环境
+    const requestHostname = new URL(request.url).hostname;
+    let sniHost = requestHostname;
+    if (proxySettings.useProxyUrlForSni && proxySettings.wsReverseProxyUrl) {
+        try {
+            sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
+        } catch (e) { }
+    }
+    const globalPath = proxySettings.wsReverseProxyPath || '/';
+    const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
+    const specificUuid = proxySettings.wsReverseProxySpecificUuid;
+
+    // 2. 展开 ADDAPI：遇到 http(s):// 且不是 vless/vmess 的行，先去拉取文本
+    const rawLines = content
+        .split('\n')
+        .map(l => l.trim())
+        .filter(Boolean);
+
+    const expandedLines = [];
+
+    for (const line of rawLines) {
+        const isHttp = line.startsWith('http://') || line.startsWith('https://');
+        const isShareLink = line.startsWith('vless://') || line.startsWith('vmess://');
+
+        if (isHttp && !isShareLink) {
+            // 把它当成 ADDAPI：远程拉取并展开
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 3000); // 3 秒超时，防止卡死
+
+                const resp = await fetch(line, {
+                    headers: { 'User-Agent': 'CF-DNS-Clone-Worker' },
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+
+                if (resp.ok) {
+                    const text = await resp.text();
+                    const apiLines = text
+                        .split(/\r?\n/)
+                        .map(l => l.trim())
+                        .filter(Boolean);
+                    expandedLines.push(...apiLines);
+                } else {
+                    // 拉失败就保留原行，后面按普通节点再尝试解析
+                    expandedLines.push(line);
+                }
+            } catch (e) {
+                console.warn(`ADDAPI Fetch failed for ${line}:`, e && e.message ? e.message : e);
+                expandedLines.push(line);
+            }
+        } else {
+            expandedLines.push(line);
+        }
+    }
+
+    // 3. 把展开后的所有行统一解析成 VLESS
+    return expandedLines.map(line => {
+        try {
+            // 支持可选 @路径
+            const pathParts = line.split('@');
+            const mainPart = pathParts[0];           // 地址[#备注]
+            const customPath = pathParts.length > 1 ? pathParts[1] : null;
+
+            // 支持可选 #备注（里面可以继续包含 #，所以只拆第一次前面的地址）
+            const remarkParts = mainPart.split('#');
+            const addressPort = remarkParts[0].trim();
+            const remarks = remarkParts.slice(1).join('#').trim();
+
+            let address;
+            let port;
+
+            // ① IPv6: [2606:4700::]:2053 或 [2606:4700::]
+            const ipv6Match = addressPort.match(/^\[([^\]]+)\](?::(\d+))?$/);
+            if (ipv6Match) {
+                address = ipv6Match[1];
+                port = ipv6Match[2] ? parseInt(ipv6Match[2], 10) : 443;
+            } else {
+                // ② 域名 / IPv4: host:port 或 host
+                const parts = addressPort.split(':');
+                if (parts.length === 2) {
+                    address = parts[0];
+                    port = parseInt(parts[1], 10);
+                } else if (parts.length === 1) {
+                    address = parts[0];
+                    port = 443; // 没写端口就默认 443
+                } else {
+                    // 非法格式，跳过
+                    return null;
+                }
+            }
+
+            if (!address) return null;
+
+            const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
+            const finalPath = customPath ? `/${customPath.replace(/^\//, '')}` : globalPath;
+            const encodedPath = encodeURIComponent(encodeURIComponent(finalPath));
+            const finalRemarks = remarks || 'Custom';
+
+            return `${_k(['vle','ss'])}://${uuid}@${address}:${port}` +
+                   `?encryption=none&security=tls&sni=${sniHost}` +
+                   `&fp=random&type=${_k(['w','s'])}&host=${sniHost}` +
+                   `&path=${encodedPath}#${encodeURIComponent(finalRemarks)}`;
+        } catch (e) {
+            console.error(`Error parsing custom node line: ${line}`, e);
+            return null;
+        }
+    }).filter(Boolean); // 去掉解析失败的 null
 }
+
 
 async function syncAllIpSourcesToD1(env, log) {
     const db = env.WUYA;
