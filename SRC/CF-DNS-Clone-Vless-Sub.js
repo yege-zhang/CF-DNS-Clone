@@ -248,6 +248,7 @@ async function handleNodeListRequest(request, env, id) {
   }
 }
 
+// 根据 GitHub IP 源生成节点：支持“备注自动命名”
 async function generateIpSourceNodes(ipSources, githubSettings, proxySettings, request) {
     if (!ipSources || ipSources.length === 0 || !githubSettings.token) {
         return [];
@@ -269,25 +270,52 @@ async function generateIpSourceNodes(ipSources, githubSettings, proxySettings, r
 
     for (const source of ipSources) {
         try {
-            const content = await getGitHubContent(githubSettings.token, githubSettings.owner, githubSettings.repo, source.github_path);
+            // 拉取 GitHub 上对应文件内容
+            const content = await getGitHubContent(
+                githubSettings.token,
+                githubSettings.owner,
+                githubSettings.repo,
+                source.github_path
+            );
             if (!content) continue;
 
-            const ips = content.split('\n').map(ip => ip.trim()).filter(Boolean);
-            const customNames = (source.node_names || '').split('\n').map(name => name.trim()).filter(Boolean);
+            // 每行一个 IP
+            const ips = content
+                .split('\n')
+                .map(ip => ip.trim())
+                .filter(Boolean);
+
+            // 节点备注 / 名称，一行一个（来自面板里的“节点名称”文本框）
+            let customNames = (source.node_names || '')
+                .split('\n')
+                .map(name => name.trim())
+                .filter(Boolean);
+
+            // ⭐ 重点：如果只填了一行备注，而 IP 有多行，则自动按 “备注 #1 / #2 / ...” 生成
+            if (customNames.length === 1 && ips.length > 1) {
+                const base = customNames[0];
+                customNames = ips.map((_, idx) => `${base} #${idx + 1}`);
+            }
 
             const nodes = ips.map((ip, index) => {
+                // 优先用每行名称；如果不存在，就退回用 IP 本身当节点名
                 const remarks = customNames[index] || ip;
                 const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
                 const encodedPath = encodeURIComponent(encodeURIComponent(globalPath));
                 
-                return `${_k(['vle','ss'])}://${uuid}@${ip}:443?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
+                return `${_k(['vle','ss'])}://${uuid}@${ip}:443`
+                    + `?encryption=none&security=tls&sni=${sniHost}&fp=random`
+                    + `&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}`
+                    + `#${encodeURIComponent(remarks)}`;
             });
+
             allGeneratedNodes.push(...nodes);
 
         } catch (e) {
             console.error(`Error generating nodes from IP source ${source.github_path}: ${e.message}`);
         }
     }
+
     return allGeneratedNodes;
 }
 
@@ -1801,11 +1829,25 @@ async function getDashboardPage(domains, ipSources, settings) {
       <label for="commit_message">Commit 信息</label>
       <input type="text" id="commit_message" placeholder="Update Cloudflare IPs" required>
       
-      <label class="form-control-inline"><input type="checkbox" id="is_node_generation_enabled" name="is_node_generation_enabled" role="switch"><span>生成节点</span></label>
-      <div id="node_names_container" style="display: none; margin-top: 1rem;">
-        <label for="node_names">节点名称 (每行一个)</label>
-        <textarea id="node_names" name="node_names" rows="5" placeholder="节点名称1\n节点名称2\n..."></textarea>
-      </div>
+      <label class="form-control-inline">
+  <input type="checkbox" id="is_node_generation_enabled" name="is_node_generation_enabled" role="switch">
+  <span>生成节点（从本 IP 源自动生成节点）</span>
+</label>
+<div id="node_names_container" style="display: none; margin-top: 1rem;">
+  <label for="node_names">节点备注（每行一个，可选）</label>
+  <textarea
+    id="node_names"
+    name="node_names"
+    rows="5"
+    placeholder="一行一个名称：
+若只写一行，则自动按名称 #1 / #2 递增编号。
+若留空，则使用 IP 自动命名。"></textarea>
+  <small>
+    提示：这里的备注只影响「GitHub 上传」生成的节点名称，
+    与上方的域名克隆列表互不干扰。
+  </small>
+</div>
+
       
       <footer>
         <button type="button" class="secondary" onclick="window.closeModal('ipSourceModal')">取消</button>
